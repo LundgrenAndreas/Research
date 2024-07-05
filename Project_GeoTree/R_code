@@ -149,7 +149,7 @@ df_lag <- left_join(df0, dfcors_lag, by = c("Forest", "Tradslag")) %>% left_join
 analysis1 <- df %>% ungroup() %>%
   # df_lag %>% ungroup %>%
   select(-Forest, -Maxtemp_cor, -Mintemp_cor) %>%
-  rename("Soil_moisture_model" = "Soil_Moisturec_25m_buffermean", "Soil_moisture_estim" = "Markfuktighet_kort",
+  rename("Soil_moisture_model" = "Soil_Moisture_25m_buffermean", "Soil_moisture_estim" = "Markfuktighet_kort",
          "Tree growth" = "mean_trw", "Sensitivity" = "mean_sensitivity",
          "Precipitation" = "Precip_cor", "Temperature" = "Meantemp_cor", "SPEI" = "SPEI6_cor", "Season" = "Season_cor",
          "VPD" = "VPD_cor", "VPD > 1.5 kPa" = "VPD_threshold_cor") %>%
