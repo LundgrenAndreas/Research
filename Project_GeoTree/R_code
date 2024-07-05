@@ -97,7 +97,7 @@ season_climvars <- left_join(growing_start, growing_end, by = c("Forest", "Year"
   left_join(growing_season, ., by = c("Forest", "Year")) %>%
   filter(dayofyear>dayofyear.x-4 & dayofyear<dayofyear.y+1) %>% group_by(Forest, Year) %>%
   mutate(VPD_threshold = case_when(VPD_thresh>1.5 ~ "Yes", T ~ "No")) %>%
-  summarise(across(c("Precip", "Temper", "Tempermax", "Tempermin", "Spei6", "VPD", "season_length"), mean, na.rm=TRUE),
+  summarise(across(c("Precip", "Temper", "Tempermax", "Tempermin", "Spei", "VPD", "season_length"), mean, na.rm=TRUE),
             VPD_threshold = sum(VPD_threshold == "Yes"))
 
 #### Pre-analysis ####
@@ -126,7 +126,7 @@ dfcors <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na(
   left_join(., season_climvars, by = c("Forest", "Year")) %>% drop_na() %>%
   group_by(Forest, Tradslag) %>%
   summarise(Precip_cor = cor(trw, Precip), Meantemp_cor = cor(trw, Temper), Maxtemp_cor = cor(trw, Tempermax),
-            Mintemp_cor = cor(trw, Tempermin), SPEI6_cor = cor(trw, Spei6), Season_cor = cor(trw, season_length),
+            Mintemp_cor = cor(trw, Tempermin), SPEI_cor = cor(trw, Spei), Season_cor = cor(trw, season_length),
             VPD_cor = cor(trw, VPD), VPD_threshold_cor = cor(trw, VPD_threshold))
 ## Lag growth correlation to environment (t-1)
 dfcors_lag <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na() %>%
@@ -136,7 +136,7 @@ dfcors_lag <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop
   left_join(., season_climvars, by = c("Forest", "Year")) %>% drop_na() %>%
   group_by(Forest, Tradslag) %>%
   summarise(Precip_cor = cor(trw, Precip), Meantemp_cor = cor(trw, Temper), Maxtemp_cor = cor(trw, Tempermax),
-            Mintemp_cor = cor(trw, Tempermin), SPEI6_cor = cor(trw, Spei6), Season_cor = cor(trw, season_length),
+            Mintemp_cor = cor(trw, Tempermin), SPEI_cor = cor(trw, Spei), Season_cor = cor(trw, season_length),
             VPD_cor = cor(trw, VPD), VPD_threshold_cor = cor(trw, VPD_threshold))
 ## Join productivity, sensitivity and environmental correlations, and Site metrics
 df0 <- left_join(productivity, sensitivity, by = c("Forest", "Tradslag"))
@@ -151,7 +151,7 @@ analysis1 <- df %>% ungroup() %>%
   select(-Forest, -Maxtemp_cor, -Mintemp_cor) %>%
   rename("Soil_moisture_model" = "Soil_Moisture_25m_buffermean", "Soil_moisture_estim" = "Markfuktighet_kort",
          "Tree growth" = "mean_trw", "Sensitivity" = "mean_sensitivity",
-         "Precipitation" = "Precip_cor", "Temperature" = "Meantemp_cor", "SPEI" = "SPEI6_cor", "Season" = "Season_cor",
+         "Precipitation" = "Precip_cor", "Temperature" = "Meantemp_cor", "SPEI" = "SPEI_cor", "Season" = "Season_cor",
          "VPD" = "VPD_cor", "VPD > 1.5 kPa" = "VPD_threshold_cor") %>%
   gather(key="Parameter", value="Value", -Tradslag, -Mean_annual_temperature, -Soil_moisture_model, -Soil_moisture_estim)
 analysis1$Parameter <- factor(analysis1$Parameter, levels = c("Tree growth", "Sensitivity", "Precipitation", "Temperature",
