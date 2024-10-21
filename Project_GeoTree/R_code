@@ -101,9 +101,8 @@ season_climvars <- left_join(growing_start, growing_end, by = c("Forest", "Year"
             VPD_threshold = sum(VPD_threshold == "Yes"))
 
 #### Pre-analysis ####
-## Select only trees between 40-60 years old
-TRW_data <- dftrw %>% group_by(Forest, Tradslag) %>% filter(n()<59) %>% filter(n()>40) %>% ungroup() %>%
-  distinct(Forest, Tradslag, Ringsasong, .keep_all = TRUE)
+## Select only trees between 40-60 years old and only 1 tree per site
+TRW_data <- dftrw %>% group_by(Forest, Tradslag) %>% filter(n()<59) %>% filter(n()>40) %>% ungroup()
 ## Mean productivity (ring width) during the first 40 years
 productivity <- TRW_data %>% group_by(Forest, Tradslag) %>% slice(tail(row_number(), 40)) %>% summarise(mean_trw = mean(Arsringsbredd))
 ## Mean sensitivity and environmental dependency
@@ -141,8 +140,8 @@ dfcors_lag <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop
             VPD_cor = cor(trw, VPD), VPD_threshold_cor = cor(trw, VPD_threshold))
 ## Join productivity, sensitivity and environmental correlations, and Site metrics
 df0 <- left_join(productivity, sensitivity, by = c("Forest", "Tradslag"))
-df <- left_join(df0, dfcors, by = c("Forest", "Tradslag")) %>% left_join(., Site_data, by = "Forest")
-df_lag <- left_join(df0, dfcors_lag, by = c("Forest", "Tradslag")) %>% left_join(., Site_data, by = "Forest")
+df <- left_join(df0, dfcors, by = c("Forest", "Tradslag")) %>% left_join(., dfsite, by = "Forest")
+df_lag <- left_join(df0, dfcors_lag, by = c("Forest", "Tradslag")) %>% left_join(., dfsite, by = "Forest")
 
 #### Analysis ####
 ### Effect of MAT and soil moisture (modelled) on growth, sensitivity, and environmental correlations
@@ -150,8 +149,7 @@ df_lag <- left_join(df0, dfcors_lag, by = c("Forest", "Tradslag")) %>% left_join
 analysis1 <- df %>% ungroup() %>%
   # df_lag %>% ungroup %>%
   select(-Forest, -Maxtemp_cor, -Mintemp_cor) %>%
-  rename("Soil_moisture_model" = "Soil_Moisture_25m_buffermean", "Soil_moisture_estim" = "Markfuktighet_kort",
-         "Tree growth" = "mean_trw", "Sensitivity" = "mean_sensitivity",
+  rename("Tree growth" = "mean_trw", "Sensitivity" = "mean_sensitivity",
          "Precipitation" = "Precip_cor", "Temperature" = "Meantemp_cor", "SPEI" = "SPEI_cor", "Season" = "Season_cor",
          "VPD" = "VPD_cor", "VPD > 1.5 kPa" = "VPD_threshold_cor") %>%
   gather(key="Parameter", value="Value", -Tradslag, -Mean_annual_temperature, -Soil_moisture_model, -Soil_moisture_estim)
@@ -627,4 +625,3 @@ Soil_plot_extr <- plot_data %>%
 
 coinc_plots <- ggarrange(MAT_plot_extr, Soil_plot_extr, ncol = 1)
 # coinc_plots
-
