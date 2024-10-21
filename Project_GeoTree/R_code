@@ -101,12 +101,10 @@ season_climvars <- left_join(growing_start, growing_end, by = c("Forest", "Year"
             VPD_threshold = sum(VPD_threshold == "Yes"))
 
 #### Pre-analysis ####
-## Select only trees between 40-60 years old and only 1 tree per site
-TRW_data <- dftrw %>% group_by(Forest, Tradslag) %>% filter(n()<59) %>% filter(n()>40) %>% ungroup()
 ## Mean productivity (ring width) during the first 40 years
-productivity <- TRW_data %>% group_by(Forest, Tradslag) %>% slice(tail(row_number(), 40)) %>% summarise(mean_trw = mean(Arsringsbredd))
+productivity <- dftrw %>% group_by(Forest, Tradslag) %>% slice(tail(row_number(), 40)) %>% summarise(mean_trw = mean(Arsringsbredd))
 ## Mean sensitivity and environmental dependency
-dfdetr0 <- TRW_data %>% unite(ID, c(Forest, Tradslag)) %>%
+dfdetr0 <- dftrw %>% unite(ID, c(Forest, Tradslag)) %>%
   spread(key = "ID", value = "Arsringsbredd") %>%
   mutate_all(funs(ifelse(!is.na(lag(.)) & is.na(.),0,.))) %>% mutate_all(funs(ifelse(is.na(lead(.)),NA,.))) # Fill missing years with 0 width instead of NA for detrending purposes
 ## Detrend using spline
