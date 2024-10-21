@@ -102,7 +102,8 @@ season_climvars <- left_join(growing_start, growing_end, by = c("Forest", "Year"
 
 #### Pre-analysis ####
 ## Select only trees between 40-60 years old
-TRW_data <- dftrw %>% group_by(Forest, Tradslag) %>% filter(n()<59) %>% filter(n()>40) %>% ungroup()
+TRW_data <- dftrw %>% group_by(Forest, Tradslag) %>% filter(n()<59) %>% filter(n()>40) %>% ungroup() %>%
+  distinct(Forest, Tradslag, Ringsasong, .keep_all = TRUE)
 ## Mean productivity (ring width) during the first 40 years
 productivity <- TRW_data %>% group_by(Forest, Tradslag) %>% slice(tail(row_number(), 40)) %>% summarise(mean_trw = mean(Arsringsbredd))
 ## Mean sensitivity and environmental dependency
