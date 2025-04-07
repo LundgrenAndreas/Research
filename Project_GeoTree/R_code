@@ -1,32 +1,19 @@
-#### Geographic determinants of climate change effects on boreal tree growth ####
+#### Unpacking climate effects on boreal tree growth:
+#### An analysis of tree-ring widths across temperature and soil moisture gradients
 
 # Latest compatibility check: R version 4.3.2
 
 #### Libraries ####
-library(dplyr)
-library(tidyr)
 library(ggplot2)
-library(cowplot)
 library(dplR)
-library(ggpubr)
-library(patchwork)
 library(SPEI)
-library(sp)
-library(lubridate)
 library(janitor)
 library(rstudioapi)
-library(forestmangr)
 library(tidyverse)
-library(broom)
-library(dendroTools)
-library(plotly)
-library(car)
-library(NMcalc)
-library(sf)
-library(raster)
 library(conflicted)
-library(ggspatial)
-library(sensemakr)
+library(zoo)
+library(nlme)
+library(ggeffects)
 
 #### Code handling ####
 ## Conflict handler
@@ -41,20 +28,94 @@ getwd()
 plottheme <- theme_bw() +
   theme(text = element_text(family = "serif")) +
   theme(strip.background = element_rect(colour="black", fill="#CCCCCC", linetype="solid")) +
-  theme(strip.text.x = element_text(face="italic",size=12),
-        strip.text.y = element_text(size=12))
+  theme(strip.text.y = element_text(face="italic",size=12),
+        strip.text.x = element_text(size=12))
+## Functions
+interpolate_internal <- function(series) {
+  non_na_idx <- which(!is.na(series))
+  if (length(non_na_idx) == 0) {
+    return(series)
+  }
+  start_idx <- min(non_na_idx)
+  end_idx <- max(non_na_idx)
+  series[start_idx:end_idx] <- na.approx(series[start_idx:end_idx], na.rm = FALSE)
+  return(series)
+}
+
+detrend_function <- function(data, value_col, nyrs, method = "Spline") {
+  data_spread <- data %>% select(Year, ID, all_of(value_col)) %>%
+    spread(key = "ID", value = value_col)
+  interpolated_data <- as.data.frame(lapply(data_spread[,-1], interpolate_internal))
+  colnames(interpolated_data) <- colnames(data_spread[,-1])
+  detrended_data <- detrend(interpolated_data, method = method, nyrs = nyrs)
+  detrended_data$Year <- data_spread$Year
+  return(detrended_data)
+}
+
+calculate_coincidence_rate <- function(df, param_name, high = TRUE, fraction = 0.1) {
+  df %>%
+    group_by(ID) %>%
+    mutate(n_select = ceiling(fraction * n())) %>%
+    summarise(
+      selected_rwi_years = list(Year[order(RWI)][1:n_select]),
+      selected_env_years = list(
+        if (high) {
+          Year[order(-get(param_name))][1:n_select]
+        } else {
+          Year[order(get(param_name))][1:n_select]
+        }
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      overlap_count = mapply(function(rwi, env) length(base::intersect(rwi, env)), selected_rwi_years, selected_env_years),
+      coincidence_rate = overlap_count / lengths(selected_rwi_years)
+    ) %>% select(ID, coincidence_rate)
+}
 
 #### Read data ####
 ## Tree ring data
-dftrw <- read.csv(paste0(dir, "/TRW_data.csv"))
+dftrw0 <- read.csv(paste0(dir, "/TRW_data.txt"), sep = "\t")
+dftrw0 <- dftrw0 %>% rename("Forest" = "TraktNr")
 ## Site metrics
 dfsite <- read.csv(paste0(dir, "/Site_data.csv"))
+dfsite <- dfsite %>% mutate(Forest = as.character(Forest), PalslagsNr = as.character(PalslagsNr))
 ## Climate data
 climvars <- read.csv(paste0(dir, "/Climate_data.csv"))
 
 #### Data handling ####
-## Calculate VPD
-## Reference for VPD calculation (Howell et al., 1995 - Journal of irrigation and drainage)
+## Using dplR for testing inter-series correlations
+# Notes: With this, we keep only forests that have >5 trees that pass an inter-series correlation of 0.3281
+
+trees <- dftrw0 %>% select(Taxar, Forest, PalslagNr, StamNr, Tradslag, Ringsasong, Arsringsbredd) %>%
+  filter(Tradslag == "11" | Tradslag == "21") %>%
+  group_by(Forest, PalslagNr, StamNr, Tradslag) %>% filter(Taxar == max(Taxar)) %>% ungroup() %>%
+  group_by(Taxar, Forest, PalslagNr, StamNr, Tradslag) %>% filter(n() > 39) %>% ungroup() %>%
+  unite(Forest_Species, c(Forest, Tradslag), remove = F)
+valid_forests <- trees %>% group_by(Forest_Species) %>%
+  summarise(unique_combinations = n_distinct(paste(PalslagNr, StamNr, Tradslag, sep = "_"))) %>%
+  filter(unique_combinations >= 6) %>% pull(Forest_Species)
+trees <- trees %>% filter(Forest_Species %in% valid_forests)
+split_forests <- split(trees, trees$Forest_Species)
+split_forests <- lapply(split_forests, function(df) {
+  df <- df %>% mutate(ID = paste(Taxar, Forest, PalslagNr, StamNr, Tradslag, sep = "_")) %>%
+    select(ID, Ringsasong, Arsringsbredd) %>% pivot_wider(names_from = ID, values_from = Arsringsbredd) %>%
+    select(-Ringsasong)
+  correlation <- interseries.cor(df, method="spearman")
+  return(correlation)
+})
+filtered_trees <- bind_rows(
+  lapply(names(split_forests), function(name) {
+    df <- split_forests[[name]] %>% filter(res.cor >= 0.3281) %>% mutate(Forest_Species = name, ID = rownames(.))
+    return(df)
+  })
+)
+keep_trees <- filtered_trees %>% group_by(Forest_Species) %>% filter(n() > 4) %>% separate(Forest_Species, into = c("Forest", "Tradslag"))
+
+dftrw <- dftrw0 %>% mutate(ID = paste(Taxar, Forest, PalslagNr, StamNr, Tradslag, sep = "_"))
+dftrw <- dftrw[dftrw$ID %in% keep_trees$ID,]
+
+## VPD calculation
 climvars$VPD <- ((611 * exp(17.27 * climvars$Temper / (climvars$Temper + 237.3))) / 1000) * (1 - climvars$RH / 100)
 climvars$VPD_thresh <- ((611 * exp(17.27 * climvars$Tempermax / (climvars$Tempermax + 237.3))) / 1000) * (1 - climvars$RH / 100)
 
@@ -78,14 +139,12 @@ climvars$VPD_thresh <- ((611 * exp(17.27 * climvars$Tempermax / (climvars$Temper
 # colnames(Spei_vars) <- gsub("[[:punct:]]","",colnames(Spei_vars))
 # Spei_vars <- Spei_vars %>% select(Forest, Year, Month, Spei)
 
-## Calcule growing season length, and growing season means of climate variables
-## Growing season starts at the first of four consecutive days with mean temperature > 5 C, and ends at the last day of the last four consecutive days with mean temperature > 5 C
-## Here, we also ensure that growing season does not start earlier than March or ends earlier than September
-## Some forests in the south do rarely or never go out of growing season according to this definition, so they are discarded
-growing_season <- climvars %>% separate(date, into = c("Year", "Month", "Day"), remove=FALSE) %>%
-  mutate(across(.cols = "Year":"Day", ~as.numeric(.)))
-growing_season$dayofyear <- yday(growing_season$date)
-growing_season$numbdays <- with(growing_season, ifelse(Temper > 5, 'YES', 'NO'))
+## Calculate growing season length, and growing season means of climate variables
+# Growing season starts at the first of four consecutive days with mean temperature > 5 C, and ends at the last day of the first four consecutive days with mean temperature > 5 C
+# Here, we also ensure that growing season does not start earlier than March or ends earlier than September
+growing_season <- climvars %>% separate(date, into = c("Year", "Month", "Day"), remove=F) %>%
+  mutate(across(.cols = "Year":"Day", ~as.numeric(.))) %>% mutate(dayofyear = yday(.$date)) %>%
+  mutate(numbdays = with(., ifelse(Temper > 5, 'YES', 'NO')))
 growing_season <- growing_season[with(growing_season, order(Forest, date)), ]
 growing_season$cons <- sequence(rle(as.character(growing_season$numbdays))$lengths)
 growing_start <- growing_season %>% filter(dayofyear>60 & cons>3 & numbdays == "YES") %>%
@@ -93,533 +152,274 @@ growing_start <- growing_season %>% filter(dayofyear>60 & cons>3 & numbdays == "
 growing_end <- growing_season %>% filter(dayofyear>243 & cons>3 & numbdays == "YES") %>%
   group_by(Forest, Year) %>% slice(which.max(dayofyear)) %>% filter(cons<360) %>% select(Forest, Year, dayofyear)
 season_climvars <- left_join(growing_start, growing_end, by = c("Forest", "Year")) %>%
-  drop_na() %>% mutate(season_length = 4+dayofyear.y-dayofyear.x) %>%
-  left_join(growing_season, ., by = c("Forest", "Year")) %>%
+  drop_na() %>% left_join(growing_season, ., by = c("Forest", "Year")) %>%
   filter(dayofyear>dayofyear.x-4 & dayofyear<dayofyear.y+1) %>% group_by(Forest, Year) %>%
   mutate(VPD_threshold = case_when(VPD_thresh>1.5 ~ "Yes", T ~ "No")) %>%
-  summarise(across(c("Precip", "Temper", "Tempermax", "Tempermin", "Spei", "VPD", "season_length"), mean, na.rm=TRUE),
+  summarise(across(c("Precip", "Temper", "Tempermax", "Tempermin", "Spei", "VPD"), mean, na.rm=T),
             VPD_threshold = sum(VPD_threshold == "Yes"))
 
-#### Pre-analysis ####
-## Mean productivity (ring width) during the first 40 years
-productivity <- dftrw %>% group_by(Forest, Tradslag) %>% slice(tail(row_number(), 40)) %>% summarise(mean_trw = mean(Arsringsbredd))
-## Mean sensitivity and environmental dependency
-dfdetr0 <- dftrw %>% unite(ID, c(Forest, Tradslag)) %>%
-  spread(key = "ID", value = "Arsringsbredd") %>%
-  mutate_all(funs(ifelse(!is.na(lag(.)) & is.na(.),0,.))) %>% mutate_all(funs(ifelse(is.na(lead(.)),NA,.))) # Fill missing years with 0 width instead of NA for detrending purposes
-## Detrend using spline
-dfdetr <- detrend(dfdetr0, method = "Spline")
-dfdetr$Ringsasong <- dfdetr0$Ringsasong
-## Mean sensitivity during the first 40 years
-sensitivity <- dfdetr %>% gather(key="ID", value="detr_trw", -Ringsasong) %>%
-  group_by(ID) %>% slice(tail(row_number(), 40)) %>%
-  mutate(sensitivity = abs((detr_trw - lag(detr_trw, default = first(detr_trw))) / (detr_trw + lag(detr_trw, default = first(detr_trw))))) %>%
-  filter(sensitivity > 0) %>%
-  summarise(mean_sensitivity = mean(sensitivity)) %>% separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>%
-  mutate(across(.cols = "Forest", ~as.numeric(.)))
-## Growth correlation to environment
-dfcors <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na() %>%
-  separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>%
-  rename("Year" = "Ringsasong") %>% mutate(across(.cols = "Forest", ~as.numeric(.))) %>%
-  left_join(., season_climvars, by = c("Forest", "Year")) %>% drop_na() %>%
-  group_by(Forest, Tradslag) %>%
-  summarise(Precip_cor = cor(trw, Precip), Meantemp_cor = cor(trw, Temper), Maxtemp_cor = cor(trw, Tempermax),
-            Mintemp_cor = cor(trw, Tempermin), SPEI_cor = cor(trw, Spei), Season_cor = cor(trw, season_length),
-            VPD_cor = cor(trw, VPD), VPD_threshold_cor = cor(trw, VPD_threshold))
-## Lag growth correlation to environment (t-1)
-dfcors_lag <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na() %>%
-  separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>%
-  rename("Year" = "Ringsasong") %>% mutate(Year = Year-1) %>%
-  mutate(across(.cols = "Forest", ~as.numeric(.))) %>%
-  left_join(., season_climvars, by = c("Forest", "Year")) %>% drop_na() %>%
-  group_by(Forest, Tradslag) %>%
-  summarise(Precip_cor = cor(trw, Precip), Meantemp_cor = cor(trw, Temper), Maxtemp_cor = cor(trw, Tempermax),
-            Mintemp_cor = cor(trw, Tempermin), SPEI_cor = cor(trw, Spei), Season_cor = cor(trw, season_length),
-            VPD_cor = cor(trw, VPD), VPD_threshold_cor = cor(trw, VPD_threshold))
-## Join productivity, sensitivity and environmental correlations, and Site metrics
-df0 <- left_join(productivity, sensitivity, by = c("Forest", "Tradslag"))
-df <- left_join(df0, dfcors, by = c("Forest", "Tradslag")) %>% left_join(., dfsite, by = "Forest")
-df_lag <- left_join(df0, dfcors_lag, by = c("Forest", "Tradslag")) %>% left_join(., dfsite, by = "Forest")
-
 #### Analysis ####
-### Effect of MAT and soil moisture (modelled) on growth, sensitivity, and environmental correlations
-## Statistics (swap for df_lag for lag effects)
-analysis1 <- df %>% ungroup() %>%
-  # df_lag %>% ungroup %>%
-  select(-Forest, -Maxtemp_cor, -Mintemp_cor) %>%
-  rename("Tree growth" = "mean_trw", "Sensitivity" = "mean_sensitivity",
-         "Precipitation" = "Precip_cor", "Temperature" = "Meantemp_cor", "SPEI" = "SPEI_cor", "Season" = "Season_cor",
-         "VPD" = "VPD_cor", "VPD > 1.5 kPa" = "VPD_threshold_cor") %>%
-  gather(key="Parameter", value="Value", -Tradslag, -Mean_annual_temperature, -Soil_moisture_model, -Soil_moisture_estim)
-analysis1$Parameter <- factor(analysis1$Parameter, levels = c("Tree growth", "Sensitivity", "Precipitation", "Temperature",
-                                                                "SPEI", "VPD", "VPD > 1.5 kPa", "Season"))
+## Detrending data
+df0 <- dftrw %>% rename("Year" = "Ringsasong", "PalslagsNr" = "PalslagNr") %>%
+  left_join(., season_climvars, by = c("Forest", "Year")) %>% mutate(Spei2 = Spei - min(Spei, na.rm = T) + 0.1) %>%
+  drop_na()
+detrended_rwi <- detrend_function(df0, "Arsringsbredd", 30) %>% select(-c("2018_2023_405_5_21", "2019_3057_410_15_21", "2020_3054_410_2_21",
+                                                                             "2021_2062_215_10_11", "2022_2073_305_13_21", "2022_4216_204_3_21",
+                                                                             "2022_4216_208_1_21", "2018_3014_205_5_11", "2021_4237_104_1_11"))
 
-## Statistics 
-prod_stats <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "Tree growth"))
-Anova(prod_stats, type = 2)
-sens_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "Sensitivity"))
-Anova(sens_mod, type = 2)
-prec_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "Precipitation"))
-Anova(prec_mod, type = 2)
-temp_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "Temperature"))
-Anova(temp_mod, type = 2)
-spei_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "SPEI"))
-Anova(spei_mod, type = 2)
-vpd_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "VPD"))
-Anova(vpd_mod, type = 2)
-vpdthreshold_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "VPD > 1.5 kPa"))
-Anova(vpdthreshold_mod, type = 2)
-seas_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(analysis1, Parameter == "Season"))
-Anova(seas_mod, type = 2)
+rwi1 <- detrended_rwi %>% gather(key = "ID", value = "RWI", -Year)
+filter_flawed <- rwi1 %>% group_by(ID) %>% filter(any(RWI > 3)) %>% ungroup()
 
-### Figures for effect of MAT and soil moisture (modelled) on growth, sensitivity, and environmental correlations
-effect_table <- analysis1 %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%                     # This line for MAT plot
-  # mutate(model = map(data, ~lm(Value~scale(Mean_annual_temperature, scale = F)+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>% # This line for soil moisture plot
-  unnest(tidied) %>%
-  select(Parameter, Tradslag, term, estimate) %>%
-  spread(key="term", value="estimate") %>%
-  rename("Temp_slope" = "Mean_annual_temperature", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)                            # This line for MAT plot
-  # rename("Temp_slope" = "scale(Mean_annual_temperature, scale = F)", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)        # This line for soil moisture plot
-## Abline limits for plots
-mat_abline <- analysis1 %>% drop_na(Mean_annual_temperature) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Mean_annual_temperature), xstop = max(Mean_annual_temperature)) %>%
-  left_join(effect_table, ., by = c("Tradslag", "Parameter"))
-soil_abline <- analysis1 %>% drop_na(Soil_moisture_model) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Soil_moisture_model), xstop = max(Soil_moisture_model)) %>%
-  left_join(effect_soil, ., by = c("Tradslag", "Parameter"))
-## Regression statistics for plots
-effect_table2 <- analysis1 %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%
-  unnest(tidied) %>% select(Tradslag, Parameter, model) %>% distinct()
-r_sqrs_mat <- numeric(length(effect_table2$model))
-r_sqrs_soil <- numeric(length(effect_table2$model))
-for (i in seq_along(effect_table2$model)) {
-  r_sqrs_mat[i] <- partial_r2(effect_table2$model[[i]])[2]
-  r_sqrs_soil[i] <- partial_r2(effect_table2$model[[i]])[3]
-}
-r_sqrs <- cbind(effect_table2, r_sqrs_mat, r_sqrs_soil) %>%
-  select(-model) %>%
-  mutate(r_sqrs_mat = round(r_sqrs_mat, 3), r_sqrs_soil = round(r_sqrs_soil, 3))
-r_sqrs$r_sqrs_mat <- sprintf("%05.3f", r_sqrs$r_sqrs_mat)
-r_sqrs$r_sqrs_soil <- sprintf("%05.3f", r_sqrs$r_sqrs_soil)
-## Gather plot data
-plot_data <- left_join(analysis1, effect_table, by = c("Tradslag", "Parameter")) %>% left_join(., r_sqrs, by = c("Tradslag", "Parameter")) %>%
-  drop_na(Value) %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95)
-ylim_height <- plot_data %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95) %>% summarise(height=mean(height))
-r_sqrs <- left_join(r_sqrs, ylim_height, by = "Parameter")
-## Labs for plot
-plot_ylabs <- plot_data %>% mutate(labbies = case_when(Parameter == "Tree growth" ~ "TRW (mm)",
-                                                    Parameter == "Sensitivity" ~ " ", T ~ "r")) %>%
-  filter(Tradslag == "B. pendula") %>% select(Tradslag, Parameter, labbies) %>% distinct()
-labpos <- plot_data %>% group_by(Parameter) %>% summarise(maxheight = max(Value), minheight = min(Value)) %>%
-  mutate(labheight = (maxheight+minheight)/2) %>% select(Parameter, labheight)
-plot_data <- left_join(plot_data, plot_ylabs, by = c("Tradslag", "Parameter")) %>% left_join(., labpos, by = "Parameter")
-ylabxpos_MAT <- min(plot_data$Mean_annual_temperature, na.rm = T)-(0.25*(max(plot_data$Mean_annual_temperature, na.rm = T)-min(plot_data$Mean_annual_temperature, na.rm = T)))
-ylabxpos_soil <- min(plot_data$Soil_moisture_model, na.rm = T)-(0.25*(max(plot_data$Soil_moisture_model, na.rm = T)-min(plot_data$Soil_moisture_model, na.rm = T)))
+detrended_temper <- detrend_function(df0, "Temper", 30)
+detrended_spei <- detrend_function(df0, "Spei2", 30)
+detrended_precip <- detrend_function(df0, "Precip", 30)
+detrended_VPD <- detrend_function(df0, "VPD", 30)
 
-## Figure for MAT effect
-MAT_plot <- plot_data %>%
-  ggplot(aes(x=Mean_annual_temperature, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=mat_abline, aes(x=xstart, xend=xstop,
-                                    y=Intercept+Temp_slope*xstart, yend=Intercept+Temp_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_mat), family = "serif", fontface = "italic",
-            x=1.5, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_mat), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=-0.4, y=plot_data$height) +
-  geom_text(mapping = aes(label = labbies), family="serif", x=ylabxpos_MAT, y=plot_data$labheight, angle=90) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
-  plottheme +
-  labs(x="Mean annual temperature (°C)", y=" ") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-# Mat_plot
+rwi1 <- detrended_rwi %>% gather(key = "ID", value = "RWI", -Year) %>% filter(!ID %in% filter_flawed$ID)
+rwi <- rwi1
+temper <- detrended_temper %>% gather(key = "ID", value = "Temper", -Year)
+precip <- detrended_precip %>% gather(key = "ID", value = "Precip", -Year)
+VPD <- detrended_VPD %>% gather(key = "ID", value = "VPD", -Year)
+spei <- detrended_spei %>% gather(key = "ID", value = "SPEI", -Year)
+raw <- df0 %>% select(Year, ID, Arsringsbredd)
 
-## Figure for Soil moisture (modelled) effect
-Soil_plot <- plot_data %>%
-  ggplot(aes(x=Soil_moisture_model, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=soil_abline, aes(x=xstart, xend=xstop,
-                                     y=Intercept+Soil_slope*xstart, yend=Intercept+Soil_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_soil), family = "serif", fontface = "italic",
-            x=95, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_soil), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=77, y=plot_data$height) +
-  geom_text(mapping = aes(label = labbies), family="serif", x=ylabxpos_soil, y=plot_data$labheight, angle=90) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
-  plottheme +
-  labs(x="Soil moisture", y=" ") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-# Soil_plot
+df <- rwi %>% left_join(temper, by = c("Year", "ID")) %>% left_join(precip, by = c("Year", "ID")) %>%
+  left_join(VPD, by = c("Year", "ID")) %>% left_join(spei, by = c("Year", "ID")) %>% left_join(raw, by = c("Year", "ID")) %>%
+  separate(ID, into = c("Taxar", "Forest", "PalslagsNr", "Tree_no", "Species"), remove = F) %>%
+  left_join(., dfsite, by = c("Forest", "PalslagsNr")) %>% drop_na() %>% unite(Site, c(Forest, PalslagsNr), remove = F) %>%
+  mutate(Forest = as.factor(Forest), ID = as.factor(ID), Species = as.factor(Species), Site = as.factor(Site), Year2 = scale(Year, center = T, scale = F))
 
-### Effect of field estimated soil moisture
-## Statistics
-prod_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "Tree growth"))
-summary(prod_mod_estim)
-sens_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "Sensitivity"))
-summary(sens_mod_estim)
-prec_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "Precipitation"))
-summary(prec_mod_estim)
-temp_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "Temperature"))
-summary(temp_mod_estim)
-spei_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "SPEI"))
-summary(spei_mod_estim)
-vpd_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "VPD"))
-summary(vpd_mod_estim)
-vpdthreshold_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "VPD > 1.5 kPa"))
-summary(vpdthreshold_mod_estim)
-seas_mod_estim <- lm(Value ~ Soil_moisture_estim, filter(analysis1, Parameter == "Season"))
-summary(seas_mod_estim)
-
-## Figure for Soil moisture (estimated) effect
-Soil_estim_plot <- df_latsoil %>%
-  ggplot(aes(x=Soil_moisture_estim, y=Value)) + 
-  geom_boxplot(aes(fill=Tradslag)) +
-  scale_fill_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
-  plottheme +
-  labs(x="Soil moisture (field estimation)", y=" ") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-# Soil_estim_plot
-
-### Predicted : observed ratio of extreme years
-## Find extremes
-## High temperature
-dfextr_temp <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na() %>%
-  separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>%
-  rename("Year" = "Ringsasong") %>% mutate(across(.cols = "Forest", ~as.numeric(.))) %>%
-  left_join(., season_climvars, by = c("Forest", "Year")) %>% select(Forest, Tradslag, trw, Temper) %>%
-  unite(Group, c(Forest, Tradslag)) %>% drop_na()
-fit_and_predict_top_10 <- function(data) {
-  # Find the 10% cutoff temperatures for each group
-  top_10_cutoff <- dfextr_temp %>%
-    group_by(Group) %>%
-    mutate(cutoff_temp = quantile(Temper, probs = 0.9)) %>%
-    filter(Temper >= cutoff_temp) %>%
-    summarise(cutoff_temp = mean(Temper))
-  # Fit linear models and make predictions
-  predictions <- lapply(1:nrow(top_10_cutoff), function(i) {
-    group <- top_10_cutoff$Group[i]
-    temp_cutoff <- top_10_cutoff$cutoff_temp[i]
-    subset_data <- data %>%
-      filter(Group == group, Temper <= temp_cutoff)
-    model <- lm(trw ~ Temper, data = subset_data)
-    new_data <- data.frame(Temper = temp_cutoff)
-    predicted_growth <- predict(model, newdata = new_data)
-    # Return data
-    return(data.frame(Group = group, Cutoff_Temperature = temp_cutoff, 
-                      Predicted_Growth = predicted_growth))
-  })
-  # Combine results into a single data frame
-  predictions_df <- do.call(rbind, predictions)
-  return(predictions_df)
-}
-predobs_hightemp <- fit_and_predict_top_10(dfextr_temp)
-obs_temp <- dfextr_temp %>%
-  group_by(Group) %>%
-  mutate(cutoff_temp = quantile(Temper, probs = 0.9)) %>%
-  filter(Temper >= cutoff_temp) %>%
-  summarise(Cutoff_Temperature = mean(Temper), Growth = mean(trw))
-
-## Low precipitation
-dfextr_precip <- dfdetr %>% gather(key = "ID", value = "trw", -Ringsasong) %>% drop_na() %>%
-  separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>%
-  rename("Year" = "Ringsasong") %>% mutate(across(.cols = "Forest", ~as.numeric(.))) %>%
-  left_join(., season_climvars, by = c("Forest", "Year")) %>% select(Forest, Tradslag, trw, Precip) %>%
-  unite(Group, c(Forest, Tradslag)) %>% drop_na()
-fit_and_predict_low_10 <- function(data) {
-  top_10_cutoff <- dfextr_precip %>%
-    group_by(Group) %>%
-    mutate(cutoff_precip = quantile(Precip, probs = 0.1)) %>%
-    filter(Precip <= cutoff_precip) %>%
-    summarise(cutoff_precip = mean(Precip))
-  predictions <- lapply(1:nrow(top_10_cutoff), function(i) {
-    group <- top_10_cutoff$Group[i]
-    precip_cutoff <- top_10_cutoff$cutoff_precip[i]
-    subset_data <- data %>%
-      filter(Group == group, Precip >= precip_cutoff)
-    model <- lm(trw ~ Precip, data = subset_data)
-    new_data <- data.frame(Precip = precip_cutoff)
-    predicted_growth <- predict(model, newdata = new_data)
-    return(data.frame(Group = group, Cutoff_Precip = precip_cutoff, 
-                      Predicted_Growth = predicted_growth))
-  })
-  predictions_df <- do.call(rbind, predictions)
-  return(predictions_df)
-}
-predobs_lowprecip <- fit_and_predict_low_10(dfextr_precip)
-obs_precip <- dfextr_precip %>%
-  group_by(Group) %>%
-  mutate(cutoff_precip = quantile(Precip, probs = 0.1)) %>%
-  filter(Precip <= cutoff_precip) %>%
-  summarise(Cutoff_Precip = mean(Precip), Growth = mean(trw))
-
-## Combine predicted : observed ratios
-predobs <- left_join(obs_temp, predobs_hightemp, by = c("Group", "Cutoff_Temperature")) %>%
-  mutate("High temperature" = Predicted_Growth/Growth) %>% select(Group, "High temperature") %>%
-  left_join(., obs_precip, by = "Group") %>% left_join(., predobs_lowprecip, by = c("Group", "Cutoff_Precip")) %>%
-  mutate("Low precipitation" = Predicted_Growth/Growth) %>% select(Group, "High temperature", "Low precipitation") %>%
-  separate(Group, into = c("Forest", "tradslag"), sep="_") %>%
-  gather(key="Parameter", value="Value", -Forest, -tradslag) %>%
-  mutate(Forest = as.numeric(Forest)) %>%
-  left_join(., Site_data, by = "Forest")
-
-## Descriptives statistics
-drypine <- newdf %>% filter(Parameter == "Low precipitation" & Tradslag == "P. sylvestris")
-means(drypine$Value, type = "geometric", ci = T)
-t.test(log(drypine$Value))
-dryspruce <- newdf %>% filter(Parameter == "Low precipitation" & Tradslag == "P. abies")
-means(dryspruce$Value, type = "geometric", ci = T)
-t.test(log(dryspruce$Value))
-drypen <- newdf %>% filter(Parameter == "Low precipitation" & Tradslag == "B. pendula")
-means(drypen$Value, type = "geometric", ci = T)
-t.test(log(drypen$Value))
-drypub <- newdf %>% filter(Parameter == "Low precipitation" & Tradslag == "B. pubescens")
-means(drypub$Value, type = "geometric", ci = T)
-t.test(log(drypub$Value))
-hotpine <- newdf %>% filter(Parameter == "High temperature" & Tradslag == "P. sylvestris")
-means(hotpine$Value, type = "geometric", ci = T)
-t.test(log(hotpine$Value))
-hotspruce <- newdf %>% filter(Parameter == "High temperature" & Tradslag == "P. abies")
-means(hotspruce$Value, type = "geometric", ci = T)
-t.test(log(hotspruce$Value))
-hotpen <- newdf %>% filter(Parameter == "High temperature" & Tradslag == "B. pendula")
-means(hotpen$Value, type = "geometric", ci = T)
-t.test(log(hotpen$Value))
-hotpub <- newdf %>% filter(Parameter == "High temperature" & Tradslag == "B. pubescens")
-means(hotpub$Value, type = "geometric", ci = T)
-t.test(log(hotpub$Value))
-
-## Statistics
-predobs_ht_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(predobs, Parameter == "High temperature"))
-Anova(predobs_ht_mod, type = 2)
-predobs_lp_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(predobs, Parameter == "Low precipitation"))
-Anova(predobs_lp_mod, type = 2)
-
-### Figures
-effect_table_predobs <- predobs %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%                     # This line for MAT plot
-  # mutate(model = map(data, ~lm(Value~scale(Mean_annual_temperature, scale = F)+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>% # This line for soil moisture plot
-  unnest(tidied) %>%
-  select(Parameter, Tradslag, term, estimate) %>%
-  spread(key="term", value="estimate") %>%
-  rename("Temp_slope" = "Mean_annual_temperature", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)                            # This line for MAT plot
-  # rename("Temp_slope" = "scale(Mean_annual_temperature, scale = F)", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)        # This line for soil moisture plot
-mat_abline <- predobs %>% drop_na(Mean_annual_temperature) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Mean_annual_temperature), xstop = max(Mean_annual_temperature)) %>%
-  left_join(effect_table_predobs, ., by = c("Tradslag", "Parameter")
-soil_abline <- predobs %>% drop_na(Soil_moisture_model) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Soil_moisture_model), xstop = max(Soil_moisture_model)) %>%
-  left_join(effect_table_predobs, ., by = c("Tradslag", "Parameter"))
-effect_table_predobs2 <- predobs %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%
-  unnest(tidied) %>% select(Tradslag, Parameter, model) %>% distinct()
-r_sqrs_mat <- numeric(length(effect_table_predobs2$model))
-r_sqrs_soil <- numeric(length(effect_table_predobs2$model))
-for (i in seq_along(effect_table_predobs2$model)) {
-  r_sqrs_mat[i] <- partial_r2(effect_table_predobs2$model[[i]])[2]
-  r_sqrs_soil[i] <- partial_r2(effect_table_predobs2$model[[i]])[3]
-}
-r_sqrs <- cbind(effect_table_predobs2, r_sqrs_mat, r_sqrs_soil) %>%
-  select(-model) %>%
-  mutate(r_sqrs_mat = round(r_sqrs_mat, 3), r_sqrs_soil = round(r_sqrs_soil, 3))
-r_sqrs$r_sqrs_mat <- sprintf("%05.3f", r_sqrs$r_sqrs_mat)
-r_sqrs$r_sqrs_soil <- sprintf("%05.3f", r_sqrs$r_sqrs_soil)
-plot_data <- left_join(predobs, effect_table_predobs, by = c("Tradslag", "Parameter")) %>% left_join(., r_sqrs, by = c("Tradslag", "Parameter")) %>%
-  drop_na(Value) %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95)
-ylim_height <- plot_data %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95) %>% summarise(height=mean(height))
-r_sqrs <- left_join(r_sqrs, ylim_height, by = "Parameter")
-
-## Figure for MAT effect
-MAT_plot_predobs <- plot_data %>%
-  ggplot(aes(x=Mean_annual_temperature, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=mat_abline, aes(x=xstart, xend=xstop,
-                                    y=Intercept+Temp_slope*xstart, yend=Intercept+Temp_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_mat), family = "serif", fontface = "italic",
-            x=1.5, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_mat), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=-0.4, y=plot_data$height) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
-  plottheme +
-  labs(x="Mean annual temperature (°C)", y="Predicted / Observed") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-
-## Figure for Soil moisture (modelled) effect
-Soil_plot_predobs <- plot_data %>%
-  ggplot(aes(x=Soil_moisture_model, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=soil_abline, aes(x=xstart, xend=xstop,
-                                     y=Intercept+Soil_slope*xstart, yend=Intercept+Soil_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_soil), family = "serif", fontface = "italic",
-            x=95, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_soil), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=77, y=plot_data$height) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
-  plottheme +
-  labs(x="Soil moisture", y="Predticted / Observed") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-
-predobs_plots <- ggarrange(MAT_plot_predobs, Soil_plot_predobs, ncol = 1)
-# predobs_plots
-
-#### Coincidence rate
 ## Calculate coincidence rates
-pre_coincide <- dfdetr %>% gather(key="ID", value="detr_trw", -Ringsasong) %>% drop_na() %>%
-  separate(ID, into = c("Forest", "Tradslag"), sep = "_") %>% rename("Year" = "Ringsasong") %>%
-  mutate(Forest = as.numeric(Forest)) %>% left_join(., season_climvars, by = c("Forest", "Year"))
-low_dtrw2 <- pre_coincide %>% group_by(Forest, Tradslag) %>%
-  summarise(Lowest_dtrw = quantile(detr_trw, probs = 0.1)) %>% left_join(pre_coincide, ., by = c("Forest", "Tradslag")) %>%
-  filter(detr_trw < Lowest_dtrw)
+hightemp <- calculate_coincidence_rate(df, "Temper", high = T, fraction = 0.1) %>% rename("High_temp_coincidence" = "coincidence_rate")
+lowprec <- calculate_coincidence_rate(df, "Precip", high = F, fraction = 0.1) %>% rename("Low_prec_coincidence" = "coincidence_rate")
 
-dfextrdry0 <- pre_coincide %>% group_by(Forest, Tradslag) %>%
-  summarise(Low_precip = quantile(Precip, probs = 0.1, na.rm=T)) %>%
-  left_join(pre_coincide, ., by = c("Forest", "Tradslag")) %>%
-  filter(Precip < Low_precip) %>% select(Year, Forest, Tradslag, Low_precip)
-n_extrdry_years <- dfextrdry0 %>% group_by(Forest, Tradslag) %>% summarise(number_years = n())
-dry0 <- left_join(low_dtrw2, dfextrdry0, by = c("Forest", "Year", "Tradslag")) %>% drop_na() %>%
-  group_by(Forest, Tradslag) %>% summarise(low_prec_overlap = n()) %>%
-  left_join(n_extrdry_years, ., by = c("Forest", "Tradslag")) %>%
-  mutate("Low precipitation" = low_prec_overlap/number_years) %>% replace(is.na(.), 0) %>%
-  select(-low_prec_overlap, -number_years)
+coincide_stats <- df %>% distinct(ID, Site, Species, Mean_annual_temperature, Soil_moisture_model) %>% left_join(hightemp, by = "ID") %>% left_join(lowprec, by = "ID")
 
-dfextrhot0 <- pre_coincide %>% group_by(Forest, Tradslag) %>%
-  summarise(High_temp = quantile(Temper, probs = 0.9, na.rm=T)) %>%
-  left_join(pre_coincide, ., by = c("Forest", "Tradslag")) %>%
-  filter(Temper > High_temp) %>% select(Year, Forest, Tradslag, High_temp)
-n_extrhot_years <- dfextrhot0 %>% group_by(Forest, Tradslag) %>% summarise(number_years = n())
-hot0 <- left_join(low_dtrw2, dfextrhot0, by = c("Forest", "Year", "Tradslag")) %>% drop_na() %>%
-  group_by(Forest, Tradslag) %>% summarise(high_temp_overlap = n()) %>%
-  left_join(n_extrhot_years, ., by = c("Forest", "Tradslag")) %>%
-  mutate("High temperature" = high_temp_overlap/number_years) %>% replace(is.na(.), 0) %>%
-  select(-high_temp_overlap, -number_years)
+## Calculate resistance values
+resistance_hightemp <- df %>%
+  arrange(ID, Year) %>%
+  group_by(ID) %>%
+  mutate(
+    mean_RWI_prev3 = (lag(RWI, 1) + lag(RWI, 2) + lag(RWI, 3)) / 3,
+    Resistance_temp = RWI / mean_RWI_prev3
+  ) %>% drop_na() %>%
+  filter(Temper >= quantile(Temper, 0.90, na.rm = TRUE)) %>%
+  mutate(Arbitrary_numb = row_number()) %>%
+  ungroup() %>% select(ID, Site, Resistance_temp, Mean_annual_temperature, Soil_moisture_model, Species, Arbitrary_numb)
 
-df_cr <- pre_coincide %>% select(Forest, Tradslag) %>% distinct() %>%
-  left_join(., dry0, by = c("Forest", "Tradslag")) %>%
-  left_join(., hot0, by = c("Forest", "Tradslag")) %>%
-  gather(key="Parameter", value="Value", -Forest, -Tradslag) %>%
-  left_join(., Site_data, by = "Forest")
+resistance_lowprec <- df %>%
+  arrange(ID, Year) %>%
+  group_by(ID) %>%
+  mutate(
+    mean_RWI_prev3 = (lag(RWI, 1) + lag(RWI, 2) + lag(RWI, 3)) / 3,
+    Resistance_precip = RWI / mean_RWI_prev3
+  ) %>% drop_na() %>%
+  filter(Precip <= quantile(Precip, 0.10, na.rm = TRUE)) %>%
+  mutate(Arbitrary_numb = row_number()) %>%
+  ungroup() %>% select(ID, Site, Resistance_precip, Mean_annual_temperature, Soil_moisture_model, Species, Arbitrary_numb)
 
-## Descriptive statistics
-drypine_cr <- df_cr %>% filter(Parameter == "Low precipitation" & Tradslag == "P. sylvestris")
-t.test(drypine_cr$Value, mu = 0.1)
-dryspruce_cr <- df_cr %>% filter(Parameter == "Low precipitation" & Tradslag == "P. abies")
-t.test(dryspruce_cr$Value, mu = 0.1)
-drypen_cr <- df_cr %>% filter(Parameter == "Low precipitation" & Tradslag == "B. pendula")
-t.test(drypen_cr$Value, mu = 0.1)
-drypub_cr <- df_cr %>% filter(Parameter == "Low precipitation" & Tradslag == "B. pubescens")
-t.test(drypub_cr$Value, mu = 0.1)
-hotpine_cr <- df_cr %>% filter(Parameter == "High temperature" & Tradslag == "P. sylvestris")
-t.test(hotpine_cr$Value, mu = 0.1)
-hotspruce_cr <- df_cr %>% filter(Parameter == "High temperature" & Tradslag == "P. abies")
-t.test(hotspruce_cr$Value, mu = 0.1)
-hotpen_cr <- df_cr %>% filter(Parameter == "High temperature" & Tradslag == "B. pendula")
-t.test(hotpen_cr$Value, mu = 0.1)
-hotpub_cr <- df_cr %>% filter(Parameter == "High temperature" & Tradslag == "B. pubescens")
-t.test(hotpub_cr$Value, mu = 0.1)
+resistance_stats <- left_join(resistance_hightemp, resistance_lowprec, by = c("ID", "Site", "Mean_annual_temperature", "Soil_moisture_model", "Species", "Arbitrary_numb"))
 
-## Statistics
-lowprec_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(df_cr, Parameter == "Low precipitation"))
-Anova(lowprec_mod, type = 2)
-hightemp_mod <- lm(Value ~ Mean_annual_temperature * Soil_moisture_model * Tradslag, filter(df_cr, Parameter == "High temperature"))
-Anova(hightemp_mod, type = 2)
+#### Statistics
 
-### Figures
-effect_table_cr <- df_cr %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%                     # This line for MAT plot
-  # mutate(model = map(data, ~lm(Value~scale(Mean_annual_temperature, scale = F)+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>% # This line for soil moisture plot
-  unnest(tidied) %>%
-  select(Parameter, Tradslag, term, estimate) %>%
-  spread(key="term", value="estimate") %>%
-  rename("Temp_slope" = "Mean_annual_temperature", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)                            # This line for MAT plot
-  # rename("Temp_slope" = "scale(Mean_annual_temperature, scale = F)", "Soil_slope" = "Soil_moisture_model", "Intercept" = `(Intercept)`)        # This line for soil moisture plot
-mat_abline <- df_cr %>% drop_na(Mean_annual_temperature) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Mean_annual_temperature), xstop = max(Mean_annual_temperature)) %>%
-  left_join(effect_table_cr, ., by = c("Tradslag", "Parameter"))
-soil_abline <- df_cr %>% drop_na(Soil_moisture_model) %>% group_by(Tradslag, Parameter) %>%
-  summarise(xstart = min(Soil_moisture_model), xstop = max(Soil_moisture_model)) %>%
-  left_join(df_cr, ., by = c("Tradslag", "Parameter"))
-effect_table_extr2 <- df_cr %>% nest(data = -c(Tradslag, Parameter)) %>%
-  mutate(model = map(data, ~lm(Value~Mean_annual_temperature+Soil_moisture_model, data = .)), tidied = map(model, tidy)) %>%
-  unnest(tidied) %>% select(Tradslag, Parameter, model) %>% distinct()
-r_sqrs_mat <- numeric(length(effect_table_extr2$model))
-r_sqrs_soil <- numeric(length(effect_table_extr2$model))
-for (i in seq_along(effect_table_extr2$model)) {
-  r_sqrs_mat[i] <- partial_r2(effect_table_extr2$model[[i]])[2]
-  r_sqrs_soil[i] <- partial_r2(effect_table_extr2$model[[i]])[3]
-}
-r_sqrs <- cbind(effect_table_extr2, r_sqrs_mat, r_sqrs_soil) %>%
-  select(-model) %>%
-  mutate(r_sqrs_mat = round(r_sqrs_mat, 3), r_sqrs_soil = round(r_sqrs_soil, 3))
-r_sqrs$r_sqrs_mat <- sprintf("%05.3f", r_sqrs$r_sqrs_mat)
-r_sqrs$r_sqrs_soil <- sprintf("%05.3f", r_sqrs$r_sqrs_soil)
-plot_data <- left_join(df_cr, effect_table_cr, by = c("Tradslag", "Parameter")) %>% left_join(., r_sqrs, by = c("Tradslag", "Parameter")) %>%
-  drop_na(Value) %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95)
-ylim_height <- plot_data %>% group_by(Parameter) %>% mutate(height=max(Value)*0.95) %>% summarise(height=mean(height))
-r_sqrs <- left_join(r_sqrs, ylim_height, by = "Parameter")
+## RWI
+model.temper <- lme(RWI ~ Temper * Soil_moisture_model * Species * Mean_annual_temperature,
+                   random = ~ Year2 + 1 | Site / ID,
+                   correlation = corCAR1(),
+                   data = df, na.action = na.omit)
+summary(model.temper)
+model.precip <- lme(RWI ~ Precip * Soil_moisture_model * Species * Mean_annual_temperature,
+                    random = ~ Year2 + 1 | Site / ID,
+                    correlation = corCAR1(),
+                    data = df, na.action = na.omit)
+summary(model.precip)
+model.spei <- lme(RWI ~ SPEI * Soil_moisture_model * Species * Mean_annual_temperature,
+                    random = ~ Year2 + 1 | Site / ID,
+                    correlation = corCAR1(),
+                    data = df, na.action = na.omit)
+summary(model.spei)
+model.vpd <- lme(RWI ~ VPD * Soil_moisture_model * Species * Mean_annual_temperature,
+                  random = ~ Year2 + 1 | Site / ID,
+                  correlation = corCAR1(),
+                  data = df, na.action = na.omit)
+summary(model.vpd)
 
-## Figure for MAT effect
-MAT_plot_extr <- plot_data %>%
-  ggplot(aes(x=Mean_annual_temperature, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=mat_abline, aes(x=xstart, xend=xstop,
-                                         y=Intercept+Temp_slope*xstart, yend=Intercept+Temp_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_mat), family = "serif", fontface = "italic",
-            x=1.5, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_mat), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=-0.2, y=plot_data$height) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
+## Coincidence rate
+model.hightemp <- lme(High_temp_coincidence ~ Soil_moisture_model * Species * Mean_annual_temperature,
+                      random = ~ 1 | Site, data = coincide_stats, na.action = na.omit)
+summary(model.hightemp)
+model.lowprec <- lme(Low_prec_coincidence ~ Soil_moisture_model * Species * Mean_annual_temperature,
+                      random = ~ 1 | Site, data = coincide_stats, na.action = na.omit)
+summary(model.lowprec)
+
+## Resistance values
+model.hightempres <- lme(Resistance_temp ~ Soil_moisture_model * Species * Mean_annual_temperature,
+                      random = ~ 1 | Site / ID, data = resistance_stats, na.action = na.omit)
+summary(model.hightempres)
+model.lowprecres <- lme(Resistance_precip ~ Soil_moisture_model * Species * Mean_annual_temperature,
+                         random = ~ 1 | Site / ID, data = resistance_stats, na.action = na.omit)
+summary(model.lowprecres)
+
+#### Graphs
+# Prediction details for figures
+spruce_MAT_quants <- paste0("Mean_annual_temperature[", paste(with(df[df$Species == "21",], quantile(Mean_annual_temperature, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+spruce_SM_quants <- paste0("Soil_moisture_model[", paste( with(df[df$Species == "21",], quantile(Soil_moisture_model, c(0.1, 0.9))), collapse = ", "), "]")
+pine_MAT_quants <- paste0("Mean_annual_temperature[", paste(with(df[df$Species == "11",], quantile(Mean_annual_temperature, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+pine_SM_quants <- paste0("Soil_moisture_model[", paste( with(df[df$Species == "11",], quantile(Soil_moisture_model, c(0.1, 0.9))), collapse = ", "), "]")
+
+spruce_MAT_quants_extr <- paste0("Mean_annual_temperature[", paste(with(coincide_stats[coincide_stats$Species == "21",], quantile(Mean_annual_temperature, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+spruce_SM_quants_extr <- paste0("Soil_moisture_model[", paste( with(coincide_stats[coincide_stats$Species == "21",], quantile(Soil_moisture_model, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+pine_MAT_quants_extr <- paste0("Mean_annual_temperature[", paste(with(coincide_stats[coincide_stats$Species == "11",], quantile(Mean_annual_temperature, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+pine_SM_quants_extr <- paste0("Soil_moisture_model[", paste( with(coincide_stats[coincide_stats$Species == "11",], quantile(Soil_moisture_model, c(0.1, 0.5, 0.9))), collapse = ", "), "]")
+
+## Figure 2 (RWI to temperature)
+model.spruce_temp <- lme(RWI ~ Temper * Soil_moisture_model * Mean_annual_temperature,
+                         random = ~ Year2 + 1 | Forest / ID,
+                         correlation = corCAR1(),
+                         data = df[df$Species == "21",], na.action = na.omit)
+model.pine_temp <- lme(RWI ~ Temper * Soil_moisture_model * Mean_annual_temperature,
+                       random = ~ Year2 + 1 | Forest / ID,
+                       correlation = corCAR1(),
+                       data = df[df$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_temp, terms = c("Temper", spruce_MAT_quants, spruce_SM_quants))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_temp, terms = c("Temper", pine_MAT_quants, pine_SM_quants))
+pine_pred$Species <- "P. sylvestris"
+
+fig2_data <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(as.character(group)), SMI = as.numeric(as.character(facet))) %>%
+  mutate(MAT = case_when(group2 < 2 ~ "0.1 quantile (cold)", group2 > 6 ~ "0.9 quantile (warm)", T ~ "Median")) %>%
+  mutate(SMI = case_when(SMI < 50 ~ "0.1 quantile (dry)", T ~ "0.9 quantile (moist)")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile (cold)", "Median", "0.9 quantile (warm)")), SMI = factor(SMI, levels = c("0.1 quantile (dry)", "0.9 quantile (moist)")))
+
+fig2 <- ggplot(fig2_data, aes(x = x, y = predicted, group = interaction(MAT,SMI), color = MAT, linetype = SMI)) +
+  facet_wrap(~Species) +
+  geom_line(linewidth = 1.4) +
+  labs(x = "Temperature anomaly", y = "RWI") +
+  scale_color_manual(values = c("#4393C3","black","#B2182B")) +
+  plottheme
+
+## Fig S2 (RWI to precipitation)
+model.spruce_precip <- lme(RWI ~ Precip * Soil_moisture_model * Mean_annual_temperature,
+                         random = ~ Year2 + 1 | Forest / ID,
+                         correlation = corCAR1(),
+                         data = df[df$Species == "21",], na.action = na.omit)
+model.pine_precip <- lme(RWI ~ Precip * Soil_moisture_model * Mean_annual_temperature,
+                       random = ~ Year2 + 1 | Forest / ID,
+                       correlation = corCAR1(),
+                       data = df[df$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_precip, terms = c("Precip", spruce_MAT_quants, spruce_SM_quants))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_precip, terms = c("Precip", pine_MAT_quants, pine_SM_quants))
+pine_pred$Species <- "P. sylvestris"
+
+figs2_data <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(as.character(group)), SMI = as.numeric(as.character(facet))) %>%
+  mutate(MAT = case_when(group2 < 2 ~ "0.1 quantile (cold)", group2 > 6 ~ "0.9 quantile (warm)", T ~ "Median")) %>%
+  mutate(SMI = case_when(SMI < 50 ~ "0.1 quantile (dry)", T ~ "0.9 quantile (moist)")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile (cold)", "Median", "0.9 quantile (warm)")), SMI = factor(SMI, levels = c("0.1 quantile (dry)", "0.9 quantile (moist)")))
+
+figs2 <- ggplot(figs2_data, aes(x = x, y = predicted, group = interaction(MAT,SMI), color = MAT, linetype = SMI)) +
+  facet_wrap(~Species) +
+  geom_line(linewidth = 1.4) +
+  labs(x = "Precipitation anomaly", y = "RWI") +
+  scale_color_manual(values = c("#4393C3","black","#B2182B")) +
+  plottheme
+
+## Fig 3 (coincidence rates)
+model.spruce_hightemp <- lme(High_temp_coincidence ~ Soil_moisture_model * Mean_annual_temperature,
+                         random = ~ 1 | Site,
+                         data = coincide_stats[coincide_stats$Species == "21",], na.action = na.omit)
+model.pine_hightemp <- lme(High_temp_coincidence ~ Soil_moisture_model * Mean_annual_temperature,
+                       random = ~ 1 | Site,
+                       data = coincide_stats[coincide_stats$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_hightemp, terms = c(spruce_MAT_quants_extr, spruce_SM_quants_extr))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_hightemp, terms = c(pine_MAT_quants_extr, pine_SM_quants_extr))
+pine_pred$Species <- "P. sylvestris"
+
+result.hightemp <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(group), x2 = as.numeric(as.factor(x))) %>%
+  mutate(MAT = case_when(x2 == 1 | x2 == 2 ~ "0.1 quantile", x2 == 3 | x2 == 4 ~ "Median", x2 == 5 | x2 == 6 ~ "0.9 quantile"),
+         SMI = case_when(group2 == 1 | group2 == 4 ~ "0.1 quantile", group2 == 2 | group2 == 5 ~ "Median", group2 == 3 | group2 == 6 ~ "0.9 quantile")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>% mutate(SMI = factor(SMI, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>%
+  mutate(Type = "High temperature")
+
+model.spruce_lowprec <- lme(Low_prec_coincidence ~ Soil_moisture_model * Mean_annual_temperature,
+                             random = ~ 1 | Site,
+                             data = coincide_stats[coincide_stats$Species == "21",], na.action = na.omit)
+model.pine_lowprec <- lme(Low_prec_coincidence ~ Soil_moisture_model * Mean_annual_temperature,
+                           random = ~ 1 | Site,
+                           data = coincide_stats[coincide_stats$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_lowprec, terms = c(spruce_MAT_quants_extr, spruce_SM_quants_extr))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_lowprec, terms = c(pine_MAT_quants_extr, pine_SM_quants_extr))
+pine_pred$Species <- "P. sylvestris"
+
+result.lowprec <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(group), x2 = as.numeric(as.factor(x))) %>%
+  mutate(MAT = case_when(x2 == 1 | x2 == 2 ~ "0.1 quantile", x2 == 3 | x2 == 4 ~ "Median", x2 == 5 | x2 == 6 ~ "0.9 quantile"),
+         SMI = case_when(group2 == 1 | group2 == 4 ~ "0.1 quantile", group2 == 2 | group2 == 5 ~ "Median", group2 == 3 | group2 == 6 ~ "0.9 quantile")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>% mutate(SMI = factor(SMI, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>%
+  mutate(Type = "Low precipitation")
+
+fig3_data <- rbind(result.hightemp, result.lowprec) %>% rename("Coincidence with" = "Type")
+
+fig3 <- ggplot(fig3_data, aes(x = x, y = predicted, colour = `Coincidence with`)) +
+  facet_grid(Species~SMI, labeller = labeller(SMI = label_both)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.1, linetype = "dashed") +
+  labs(x = "MAT", y = "Coincidence rate") +
   plottheme +
-  labs(x="Mean annual temperature (°C)", y="Coincidence rate") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
+  theme(legend.position = "bottom") +
+  guides(colour = guide_legend(title = "Coincidence with:")) +
+  scale_color_viridis_d(option="viridis", end=0.8)
 
-## Figure for Soil moisture (modelled) effect
-Soil_plot_extr <- plot_data %>%
-  ggplot(aes(x=Soil_moisture_model, y=Value)) + 
-  geom_point(aes(color=Tradslag), alpha=0.6) +
-  geom_segment(data=soil_abline, aes(x=xstart, xend=xstop,
-                                          y=Intercept+Soil_slope*xstart, yend=Intercept+Soil_slope*xstop), linewidth=1) +
-  geom_text(r_sqrs,
-            mapping = aes(label = r_sqrs_mat), family = "serif", fontface = "italic",
-            x=95, y=r_sqrs$height) +
-  geom_text(mapping = aes(label = r_sqrs_mat), family="serif", label = expression(paste(italic("R"^2*"="))),
-            x=77, y=plot_data$height) +
-  scale_color_viridis_d(option="viridis", end=0.6) +
-  scale_y_continuous(n.breaks = 3) +
-  facet_grid(Parameter ~ Tradslag, scales = "free_y") +
+## Fig 4 (Resistance)
+model.spruce_hightemp_res <- lme(Resistance_temp ~ Soil_moisture_model * Mean_annual_temperature,
+                             random = ~ 1 | Site / ID,
+                             data = resistance_stats[resistance_stats$Species == "21",], na.action = na.omit)
+model.pine_hightemp_res <- lme(Resistance_temp ~ Soil_moisture_model * Mean_annual_temperature,
+                           random = ~ 1 | Site / ID,
+                           data = resistance_stats[resistance_stats$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_hightemp_res, terms = c(spruce_MAT_quants_extr, spruce_SM_quants_extr))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_hightemp_res, terms = c(pine_MAT_quants_extr, pine_SM_quants_extr))
+pine_pred$Species <- "P. sylvestris"
+
+result.hightemp <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(group), x2 = as.numeric(as.factor(x))) %>%
+  mutate(MAT = case_when(x2 == 1 | x2 == 2 ~ "0.1 quantile", x2 == 3 | x2 == 4 ~ "Median", x2 == 5 | x2 == 6 ~ "0.9 quantile"),
+         SMI = case_when(group2 == 1 | group2 == 4 ~ "0.1 quantile", group2 == 2 | group2 == 5 ~ "Median", group2 == 3 | group2 == 6 ~ "0.9 quantile")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>% mutate(SMI = factor(SMI, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>%
+  mutate(Type = "High temperature")
+
+model.spruce_lowprec_res <- lme(Resistance_precip ~ Soil_moisture_model * Mean_annual_temperature,
+                            random = ~ 1 | Site / ID,
+                            data = resistance_stats[resistance_stats$Species == "21",], na.action = na.omit)
+model.pine_lowprec_res <- lme(Resistance_precip ~ Soil_moisture_model * Mean_annual_temperature,
+                          random = ~ 1 | Site / ID,
+                          data = resistance_stats[resistance_stats$Species == "11",], na.action = na.omit)
+
+spruce_pred <- predict_response(model.spruce_lowprec_res, terms = c(spruce_MAT_quants_extr, spruce_SM_quants_extr))
+spruce_pred$Species <- "P. abies"
+pine_pred <- predict_response(model.pine_lowprec_res, terms = c(pine_MAT_quants_extr, pine_SM_quants_extr))
+pine_pred$Species <- "P. sylvestris"
+
+result.lowprec <- as.data.frame(rbind(spruce_pred, pine_pred)) %>% mutate(group2 = as.numeric(group), x2 = as.numeric(as.factor(x))) %>%
+  mutate(MAT = case_when(x2 == 1 | x2 == 2 ~ "0.1 quantile", x2 == 3 | x2 == 4 ~ "Median", x2 == 5 | x2 == 6 ~ "0.9 quantile"),
+         SMI = case_when(group2 == 1 | group2 == 4 ~ "0.1 quantile", group2 == 2 | group2 == 5 ~ "Median", group2 == 3 | group2 == 6 ~ "0.9 quantile")) %>%
+  mutate(MAT = factor(MAT, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>% mutate(SMI = factor(SMI, levels = c("0.1 quantile", "Median", "0.9 quantile"))) %>%
+  mutate(Type = "Low precipitation")
+
+fig4_data <- rbind(result.hightemp, result.lowprec) %>% rename("Resistance to" = "Type")
+
+fig4 <- ggplot(fig4_data, aes(x = x, y = predicted, colour = `Resistance to`)) +
+  facet_grid(Species~SMI, labeller = labeller(SMI = label_both)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "MAT", y = "Resistance") +
   plottheme +
-  labs(x="Soil moisture", y="Coincidence rate") +
-  theme(legend.position = "none") +
-  coord_cartesian(clip = "off") +
-  theme(plot.margin = unit(c(0.1,0.1,0.1,0.6),"cm"))
-
-coinc_plots <- ggarrange(MAT_plot_extr, Soil_plot_extr, ncol = 1)
-# coinc_plots
+  theme(legend.position = "bottom") +
+  guides(colour = guide_legend(title = "Resistance to:")) +
+  scale_color_viridis_d(option="viridis", end=0.8)
