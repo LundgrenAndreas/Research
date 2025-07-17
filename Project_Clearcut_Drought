@@ -1,0 +1,551 @@
+# Latest compatibility check: R version 4.3.2
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(ggcorrplot)
+library(ggpubr)
+library(data.table)
+library(readxl)
+library(tidyverse)
+library(dplR)
+library(vegan)
+library(lme4)
+library(lmerTest)
+library(janitor)
+library(rstudioapi)
+library(car)
+library(conflicted)
+library(SPEI)
+library(nlme)
+library(ggeffects)
+
+# Conflict handler
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("lag", "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("first", "dplyr")
+conflict_prefer("yday", "lubridate")
+conflict_prefer("lmer", "lmerTest")
+
+# Set directory
+dir <- dirname(getActiveDocumentContext()$path)
+setwd(dir)
+getwd()
+
+# Themes
+plottheme <- theme_bw() +
+  theme(text = element_text(family = "serif")) +
+  theme(strip.background = element_rect(colour="black", fill="#CCCCCC", linetype="solid")) +
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+
+# Read data
+df <- read.csv(paste0(dir, "/Data/Clean/ring_widths.csv"))
+dfsoil <- read_excel(paste0(dir, "/Data/Clean/Soil_data.xlsx"))
+dftrees <- read_excel(paste0(dir, "/Data/Clean/Tree_data.xlsx"))
+soil_clim <- read.csv(paste0(dir, "/Data/Clean/Soil_clim.csv"))
+dfsites <- read_excel(paste0(dir, "/Data/Clean/Site_geography.xlsx"))
+Climvars <- read.csv(paste0(dir, "/Data/Clean/Climvars.csv"))
+
+#### Data handling ####
+
+# Calculate SPEI
+dfclimate <- Climvars %>% drop_na() %>% select(Year, Month, Precip, Min_temp, Max_temp) %>% mutate(Precip = Precip*30) %>% arrange(Year, Month) %>%
+  group_by(Year, Month) %>% summarise(Precip = mean(Precip), Min_temp = mean(Min_temp), Max_temp = mean(Max_temp))
+Spei_vars <- dfclimate
+Spei_vars$PET <- hargreaves(Ra = NULL, Tmin = dfclimate$Min_temp, Tmax = dfclimate$Max_temp, lat = 66)
+Spei_vars$BAL <- Spei_vars$Precip-Spei_vars$PET
+Spei6 <- spei(Spei_vars$BAL,6)
+Spei6df <- as.data.frame(Spei6$fitted)
+dfclimate <- cbind(dfclimate, Spei6df) %>% rename("SPEI" = "Spei6$fitted") %>% select(Year, Month, SPEI)
+Climvars <- left_join(Climvars, dfclimate, by = c("Year", "Month"))
+
+# Dendro statistics (rbar and EPS)
+dfdendro <- detrend(df, method = "Spline")
+dfdendro$year <- df$year
+dfdendro <- dfdendro %>% gather(key="ID", value="TRW", -year) %>% separate(ID, into = c("Species", "Type", "Site", "Plot", "Tree_ID")) %>%
+  unite(TypeSite, c(Type, Site, Plot), remove = F) %>% unite(ID, c(Species, Type, Site, Plot, Tree_ID), remove = F) %>% select(TypeSite, year, ID, TRW)
+site_means <- dfdendro %>% group_by(TypeSite, year) %>% summarise(Site_Mean_TRW = mean(TRW, na.rm = TRUE), .groups = "drop")
+data_with_means <- dfdendro %>% left_join(., site_means, by = c("TypeSite", "year"))
+cor_results <- data_with_means %>% group_by(ID) %>% summarise(Correlation = cor(TRW, Site_Mean_TRW, use = "complete.obs"))
+data_threshold <- data_with_means %>% left_join(cor_results, by = "ID") %>% filter(Correlation >= 0.3281) %>% select(-Site_Mean_TRW, -Correlation)
+list_dendro <- split(x = data_threshold, f = data_threshold$TypeSite)
+spread_data <- function(df) {
+  df_spread <- df %>%
+    spread(key = ID, value = TRW)
+  return(df_spread)
+}
+list_dendro <- lapply(list_dendro, spread_data)
+remove_cols <- function(df) {
+  df <- df %>%
+    select(-TypeSite, -year)
+  return(df)
+}
+list_dendro <- lapply(list_dendro, remove_cols)
+compute_rba <- function(df) {
+  correlations <- numeric(ncol(df))
+  for (i in 1:ncol(df)) {
+    other_columns_mean <- rowMeans(df[,], na.rm = T)
+    correlations[i] <- cor(df[, i], other_columns_mean, use = "complete.obs")
+  }
+  return(correlations)
+}
+correlations_list <- lapply(list_dendro, compute_rba)
+rbar <- sapply(correlations_list, mean)
+mean_correlations <- as.data.frame(rbar)
+mean_correlations$TypeSite <- rownames(mean_correlations)
+rownames(mean_correlations) <- 1:nrow(mean_correlations)
+df_names <- names(list_dendro)
+num_columns <- sapply(list_dendro, ncol)
+num_stats <- data.frame(TypeSite = df_names, Ntrees = num_columns)
+dendrostats <- left_join(mean_correlations, num_stats, by = "TypeSite") %>% select(TypeSite, Ntrees, rbar) %>%
+  mutate(EPS = Ntrees*rbar/(1+(Ntrees-1)*rbar)) %>% separate(TypeSite, into = c("Type", "Site", "Plot"), sep = "_") %>% group_by(Type) %>%
+  summarise(mean_rbar = mean(rbar), rbar_sd = sd(rbar), mean_EPS = mean(EPS), EPS_sd = sd(EPS)) %>%
+  mutate(rbar_se = rbar_sd/sqrt(9), EPS_se = EPS_sd/sqrt(9))
+
+# Remove trees that don't meet 0.3281
+keep_data <- data_threshold %>% select(-TypeSite) %>% spread(key="ID", value="TRW") %>% arrange(desc(year))
+df <- df %>% select(any_of(names(keep_data)))
+
+#### Covariates and mediator variables ####
+
+# Al/Ca ratio
+AlCa <- dfsoil %>% mutate(AlCa_ratio = Soil_Al/Soil_Ca) %>% group_by(Type, Site, Subplot) %>% summarise(AlCa_ratio = mean(AlCa_ratio))
+
+# Age structure
+age_str <- as.data.frame(colSums(!is.na(df)))
+age_str$ID <- row.names(age_str)
+age_str <- age_str %>% filter(ID != "year") %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>% drop_na() %>%
+  rename("Age" = `colSums(!is.na(df))`) %>% unite(ID, c(Type, Site, Subplot))
+master_df <- age_str %>% group_by(ID) %>% summarise(avg_age=median(Age), mean_age=mean(Age), CoV_age2=sd(Age)) %>%
+  mutate(CoV_age=(CoV_age2/mean_age)*100) %>% select(-CoV_age2) %>% separate(ID, into = c("Type", "Site", "Subplot")) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot)) %>%
+  left_join(., dfsites, by = c("Type", "Site")) %>% left_join(., AlCa, by = c("Type", "Site", "Subplot")) %>%
+  unite(Plot, c(Type, Site), remove = F)
+
+# Tree height and circumference
+tree_co <- dftrees %>% group_by(Type, Site, Subplot) %>% drop_na(Height) %>%
+  summarise(mean_height = mean(Height), CoV_height2=sd(Height), mean_cbh = mean(CBH), CoV_cbh2=sd(CBH)) %>%
+  mutate(CoV_height=(CoV_height2/mean_height)*100, CoV_cbh=(CoV_cbh2/mean_cbh)*100) %>%
+  select(-CoV_height2, -CoV_cbh2) %>% separate(Site, into = c("remove_site", "Site")) %>% select(-remove_site) %>%
+  mutate(Site = as.numeric(Site))
+master_df <- left_join(master_df, tree_co, by = c("Type", "Site", "Subplot"))
+
+# Soil temperature variability
+soil_clim <- soil_clim %>% separate(Time, into = c("Date", "Time"), sep = " ") %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"), DOY = yday(Date)) %>% separate(Date, into = c("Year", "Month", "Day")) %>%
+  group_by(ID, Year, Month, Day, DOY) %>% summarise(Temp = mean(Temp)) %>%
+  mutate(Year = as.numeric(Year), Month = as.numeric(Month), Day = as.numeric(Day)) %>%
+  filter(case_when(Year == 2024 ~ Month < 6, T ~ Month > 6)) %>% mutate(Time = Year+((DOY-1)/365)) %>%
+  filter(Time < 2024.371) %>% filter(ID != "C.9.3") %>% group_by(ID) %>%
+  summarise(Soil_clim_stability3 = sd(Temp), mean_soil_temp = mean(Temp)) %>%
+  mutate(Soil_clim_stability2 = (Soil_clim_stability3/mean_soil_temp)*100) %>%
+  separate(ID, into = c("Type", "Site", "Subplot")) %>% group_by(Type, Site, Subplot) %>%
+  summarise(soil_clim_stability = mean(Soil_clim_stability2)) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, soil_clim, by = c("Type", "Site", "Subplot"))
+
+# Soil organic matter
+org_soil <- dfsoil %>% group_by(Type, Site, Subplot) %>%
+  mutate(org_mass = Soil_dry_weight * (1-((LOI_post-Crucible_weight)/(LOI_pre-Crucible_weight)))) %>%
+  summarise(soil_org_mass = mean(org_mass))
+master_df <- left_join(master_df, org_soil, by = c("Type", "Site", "Subplot"))
+
+# Percentage spruce
+spruce_trees <- df %>% gather(key="ID", value="trw", -year) %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  distinct(Species, Type, Site, Subplot, Tree) %>% filter(Species == "Spruce") %>% group_by(Type, Site, Subplot) %>% summarise(Spruce_trees = n())
+all_trees <- df %>% gather(key="ID", value="trw", -year) %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  distinct(Species, Type, Site, Subplot, Tree) %>% group_by(Type, Site, Subplot) %>% summarise(All_trees = n())
+Spruce_percentage <- left_join(all_trees, spruce_trees, by = c("Type", "Site", "Subplot")) %>% mutate(Spruce_perc = Spruce_trees/All_trees) %>%
+  mutate(Spruce_perc = replace_na(Spruce_perc, 0)) %>% select(Type, Site, Subplot, Spruce_perc) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, Spruce_percentage, by = c("Type", "Site", "Subplot"))
+
+# Early growth
+df[,2:ncol(df)] <- df[,2:ncol(df)]*0.1*1.2       # Convert mm to cm, and correct for scanning discrepancy
+df_age <- df[order(df$year),]
+df_age[] <- lapply(df_age, function(x) 'length<-'(na.omit(x), nrow(df_age)))
+df_age <- df_age[order(df_age$year, decreasing = T),]
+acc_age_diam <- matrix(nrow = nrow(df_age), ncol = ncol(df_age))
+for (i in 2:ncol(acc_age_diam)) {
+  for (j in 1:nrow(acc_age_diam)) {
+    if (is.na(df_age[j,i])) {acc_age_diam[j,i] <- NA
+    } else if (j==1) {acc_age_diam[j,i] <- 2*sum(df_age[1:nrow(df_age),i], na.rm = T)
+    } else {acc_age_diam[j,i] <- 2*sum(df_age[1:nrow(df_age),i], na.rm = T) - (2*sum(df_age[1:(j-1),i], na.rm = T))
+    }
+  }
+}
+acc_age_diam <- as.data.frame(acc_age_diam)
+acc_age_diam[,1] <- c(nrow(acc_age_diam):1)
+colnames(acc_age_diam) <- colnames(df_age)
+
+d <- acc_age_diam %>% select(contains("Pine"))
+biom_pine <- exp((-2.2184)+(d/(d+14)*11.4219)) +
+  exp((-2.9748)+(d/(d+16)*8.8489)) +
+  exp((-2.8604)+(d/(d+10)*9.1015)) +
+  exp((-5.3338)+(d/(d+10)*9.5938)) +
+  exp((-3.3913)+(d/(d+12)*11.1106))
+d <- acc_age_diam %>% select(contains("Spruce"))
+biom_spruce <- exp((-2.4447)+(d/(d+14)*10.5381)) +
+  exp((-4.3308)+(d/(d+18)*9.9550)) +
+  exp((-1.2804)+(d/(d+13)*8.5242)) +
+  exp((-3.3912)+(d/(d+15)*9.8364)) +
+  exp((-2.2471)+(d/(d+14)*11.4873))
+acc_age_biom <- cbind(acc_age_diam$year, biom_pine, biom_spruce) 
+colnames(acc_age_biom)[1] <- "year"
+
+annual_age_biom <- matrix(nrow = nrow(acc_age_biom), ncol = ncol(acc_age_biom))
+for (i in 1:ncol(acc_age_biom)) {
+  if (i==1) {annual_age_biom <- acc_age_biom
+  }  else {
+    for (j in 1:nrow(acc_age_biom)) {
+      if (is.na(acc_age_biom[j+1,i])) {annual_age_biom[j,i] <- acc_age_biom[j,i]
+      } else {annual_age_biom[j,i] <- acc_age_biom[j,i] - acc_age_biom[j+1,i]
+      }
+    }
+  }
+}
+
+growth_pattern_stats <- annual_age_biom %>% gather(key="ID", value="annual_age_biomass", 2:ncol(annual_age_biom)) %>% drop_na(annual_age_biomass) %>%
+  separate(ID, c("Species", "Type", "Site", "Subplot", "Tree")) %>% filter(year < 21) %>%
+  group_by(Type, Site, Subplot) %>% summarise(growth_rate=mean(annual_age_biomass)) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, growth_pattern_stats, by = c("Type", "Site", "Subplot"))
+
+# Statistics of mediator variables
+mean_age_stat <- lmerTest::lmer(mean_age ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(mean_age_stat, ddf = "Kenward-Roger", type = "II")
+cov_age_stat <- lmerTest::lmer(CoV_age ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(cov_age_stat, ddf = "Kenward-Roger", type = "II")
+growth_stat <- lmerTest::lmer(growth_rate ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(growth_stat, ddf = "Kenward-Roger", type = "II")
+mean_height_stat <- lmerTest::lmer(mean_height ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(mean_height_stat, ddf = "Kenward-Roger", type = "II")
+cov_height_stat <- lmerTest::lmer(CoV_height ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(cov_height_stat, ddf = "Kenward-Roger", type = "II")
+mean_cbh_stat <- lmerTest::lmer(mean_cbh ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(mean_cbh_stat, ddf = "Kenward-Roger", type = "II")
+cov_cbh_stat <- lmerTest::lmer(CoV_cbh ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(cov_cbh_stat, ddf = "Kenward-Roger", type = "II")
+soil_clim_stat <- lmerTest::lmer(soil_clim_stability ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(soil_clim_stat, ddf = "Kenward-Roger", type = "II")
+soil_mass_stat <- lmerTest::lmer(soil_org_mass ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(soil_mass_stat, ddf = "Kenward-Roger", type = "II")
+
+#### Analysis ####
+
+## Mean sensitivity
+# Standwide mean sensitivity
+sensi_stand0 <- detrend(df, method = "Spline")
+sensi_stand0$year <- df$year
+sensi_stand <- sensi_stand0 %>% gather(key="ID", value="detr_trw", -year) %>% drop_na() %>%
+  separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>% group_by(Type, Site, Subplot, year) %>%
+  summarise(detr_trw = mean(detr_trw)) %>% filter(year >= 1969) %>% ungroup() %>% group_by(Type, Site, Subplot) %>%
+  mutate(diff = detr_trw - lag(detr_trw, default = first(detr_trw))) %>%
+  mutate(addit = detr_trw + lag(detr_trw, default = first(detr_trw))) %>%
+  mutate(sensitivity = abs(diff/addit)) %>% filter(sensitivity > 0) %>%
+  summarise(stand_sensitivity = mean(sensitivity)) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, sensi_stand, by = c("Type", "Site", "Subplot"))
+# Individual mean sensitivity
+sensi_tree <- df
+sensi_tree <- sensi_tree[order(sensi_tree$year),]
+sensi_tree[] <- lapply(sensi_tree, function(x) 'length<-'(na.omit(x), nrow(sensi_tree)))
+sensi_tree <- sensi_tree[order(sensi_tree$year, decreasing = T),]
+sensi_tree <- sensi_tree[c(nrow(sensi_tree)-54):nrow(sensi_tree),]
+sensi_tree <- detrend(sensi_tree, method = "Spline")
+sensi_tree <- sensi_tree %>% gather(key="ID", value="detr_trw") %>% group_by(ID) %>% mutate(diff = detr_trw - lag(detr_trw, default = first(detr_trw))) %>%
+  mutate(addit = detr_trw + lag(detr_trw, default = first(detr_trw))) %>%
+  mutate(sensitivity = abs(diff/addit)) %>% filter(sensitivity > 0) %>%
+  ungroup() %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  group_by(Type, Site, Subplot) %>% summarise(tree_sensitivity = mean(sensitivity)) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, sensi_tree, by = c("Type", "Site", "Subplot"))
+
+# Plot mean sensitivity
+sensi_df <- left_join(sensi_stand, sensi_tree, by = c("Type", "Site", "Subplot")) %>% group_by(Type, Site) %>% summarise(across(.cols=c(stand_sensitivity, tree_sensitivity), list(mean))) %>%
+  gather(key="Parameter", value="Value", -Type, -Site) %>%
+  mutate(Parameter = str_replace(Parameter, "stand_sensitivity_1", "Stand")) %>% mutate(Parameter = str_replace(Parameter, "tree_sensitivity_1", "Tree"))
+sensi_df$Parameter <- factor(sensi_df$Parameter, levels = c("Tree", "Stand"))
+sensi_plot <- ggplot(sensi_df, aes(x=Parameter, y=Value, fill=Type)) +
+  facet_wrap(~Parameter, scales = "free") +
+  geom_boxplot() +
+  scale_fill_viridis_d(option="viridis", end=0.6, name = "Forest type", guide = guide_legend(reverse = T), labels=c("Clearcut", "Non-clearcut")) +
+  labs(y="Sensitivity", x=element_blank()) +
+  plottheme + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  lims(y=c(0,NA))
+
+# Statistics on mean senstivity
+normality_check_growth <- ggdensity(master_df$tree_sensitivity)
+shapiro.test(master_df$tree_sensitivity)
+bartlett.test(tree_sensitivity ~ Type, master_df)
+sensi_tree_stat <- lmerTest::lmer(tree_sensitivity ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(sensi_tree_stat, ddf = "Kenward-Roger", type = "II")
+normality_check_growth <- ggdensity(master_df$stand_sensitivity)
+shapiro.test(master_df$stand_sensitivity)
+bartlett.test(stand_sensitivity ~ Type, master_df)
+sensi_stand_stat <- lmerTest::lmer(stand_sensitivity ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(sensi_stand_stat, ddf = "Kenward-Roger", type = "II")
+
+## Environmental dependency
+# Environmental dependency statistics
+envie0 <- df %>% filter(year >= 1970) 
+envie <- detrend(envie0, method = "Spline")
+envie$year <- envie0$year
+envie <- envie %>% gather(key="ID", value="dtrw", -year) %>% drop_na() %>%
+  separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  rename("Year" = "year") %>% group_by(Type, Site, Subplot, Year) %>%
+  summarise(dtrw = mean(dtrw))
+dfclimseas <- Climvars %>% filter(Month > 6, Month < 10) %>% group_by(Year) %>%
+  summarise(Precip = mean(Precip, na.rm=T), Tmean = mean(Mean_temp, na.rm=T), Tmax = mean(Max_temp, na.rm=T),
+            Tmin = mean(Min_temp, na.rm=T), SPEI = mean(SPEI, na.rm=T))
+envie <- left_join(envie, dfclimseas, by = "Year") %>% unite(Plot, c(Type, Site), remove = F) %>%
+  mutate(Year2 = scale(Year, center = T, scale = F))
+envie$Type <- as.factor(envie$Type)
+model.temper.mean <- lme(dtrw ~ Tmean * Type,
+                    random = ~ Year2 + 1 | Plot,
+                    correlation = corCAR1(),
+                    data = envie, na.action = na.omit)
+summary(model.temper.mean)
+model.temper.min <- lme(dtrw ~ Tmin * Type,
+                    random = ~ Year2 + 1 | Plot,
+                    correlation = corCAR1(),
+                    data = envie, na.action = na.omit)
+summary(model.temper.min)
+model.temper.max <- lme(dtrw ~ Tmax * Type,
+                    random = ~ Year2 + 1 | Plot,
+                    correlation = corCAR1(),
+                    data = envie, na.action = na.omit)
+summary(model.temper.max)
+model.precipitation <- lme(dtrw ~ Precip * Type,
+                        random = ~ Year2 + 1 | Plot,
+                        correlation = corCAR1(),
+                        data = envie, na.action = na.omit)
+summary(model.precipitation)
+model.spei <- lme(dtrw ~ SPEI * Type,
+                           random = ~ Year2 + 1 | Plot,
+                           correlation = corCAR1(),
+                           data = envie, na.action = na.omit)
+summary(model.spei)
+
+# Plot environmental dependency
+pred_tmean <- predict_response(model.temper.mean, terms = c("Tmean", "Type"))
+pred_tmin <- predict_response(model.temper.min, terms = c("Tmin", "Type"))
+pred_tmax <- predict_response(model.temper.max, terms = c("Tmax", "Type"))
+pred_precip <- predict_response(model.precipitation, terms = c("Precip", "Type"))
+pred_spei <- predict_response(model.spei, terms = c("SPEI", "Type"))
+
+fig_tmean <- as.data.frame(pred_tmean) %>% mutate(parameter = "Mean temperature")
+fig_tmin <- as.data.frame(pred_tmin) %>% mutate(parameter = "Minimum temperature")
+fig_tmax <- as.data.frame(pred_tmax) %>% mutate(parameter = "Maximum temperature")
+fig_precip <- as.data.frame(pred_precip) %>% mutate(parameter = "Precipitation")
+fig_spei <- as.data.frame(pred_spei) %>% mutate(parameter = "SPEI")
+
+envi_data <- rbind(fig_tmean, fig_tmin, fig_tmax, fig_precip, fig_spei)
+envi_plot <- ggplot(envi_data, aes(x = x, y = predicted, color=group)) +
+  facet_wrap(~parameter, scales = "free") +
+  geom_line(linewidth = 1.4) +
+  labs(x = "Climate anomaly", y = "RWI") +
+  scale_color_viridis_d(option="viridis", end=0.6, name = "Forest type", guide = guide_legend(reverse = T), labels=c("Clearcut", "Non-clearcut")) +
+  plottheme +
+  theme(legend.position = c(0.85, 0.25))
+
+## Resistance, Recovery, Resilience 2018
+# Detrended rerere
+rerere_detr <- detrend(df, method = "Spline")
+rerere_detr$year <- df$year
+
+rerere_df2 <- rerere_detr %>% gather(key="ID", value="trw", -year) %>% drop_na() %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  group_by(Type, Site, Subplot, year) %>% summarise(trw = mean(trw)) %>% unite(Forest, c(Type, Site, Subplot), sep = " ") %>%
+  separate(Forest, into = c("Type", "Site", "Subplot")) %>%
+  unite(Forest, c(Type, Site, Subplot), sep = " ") %>% rename("dtrw" = "trw")
+
+rerere_detr000 <- rerere_df2 %>% filter(year == 2018) %>% mutate(trw_2018 = dtrw) %>% select(Forest, trw_2018)
+rerere_detr00 <- rerere_df2 %>% filter(year > 2014, year < 2018) %>% group_by(Forest) %>% summarise(trw_pre = mean(dtrw))
+rerere_detr0 <- rerere_df2 %>% filter(year > 2018, year < 2021) %>% group_by(Forest) %>% summarise(trw_post = mean(dtrw))
+rerere_detr <- left_join(rerere_detr000, rerere_detr00, by = "Forest") %>% left_join(., rerere_detr0, by = "Forest") %>%
+  mutate(Resistance_detr = trw_2018/trw_pre, Recovery_detr = trw_post/trw_2018, Resilience_detr = trw_post/trw_pre) %>%
+  separate(Forest, into = c("Type", "Site", "Subplot")) %>% select(-trw_2018, -trw_pre, -trw_post) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+
+# Non-detrended rerere for interpretation
+rerere_df3 <- df %>% gather(key="ID", value="trw", -year) %>% drop_na() %>% separate(ID, into = c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  group_by(Type, Site, Subplot, year) %>% summarise(trw = mean(trw)) %>%
+  unite(Forest, c(Type, Site, Subplot), sep = " ")
+
+rerere000 <- rerere_df3 %>% filter(year == 2018) %>% mutate(trw_2018 = trw) %>% select(Forest, trw_2018)
+rerere00 <- rerere_df3 %>% filter(year > 2014, year < 2018) %>% group_by(Forest) %>% summarise(trw_pre = mean(trw))
+rerere0 <- rerere_df3 %>% filter(year > 2018, year < 2021) %>% group_by(Forest) %>% summarise(trw_post = mean(trw))
+rerere <- left_join(rerere000, rerere00, by = "Forest") %>% left_join(., rerere0, by = "Forest") %>%
+  mutate(Resistance = trw_2018/trw_pre, Recovery = trw_post/trw_2018, Resilience = trw_post/trw_pre) %>%
+  separate(Forest, into = c("Type", "Site", "Subplot")) %>% select(-trw_2018, -trw_pre, -trw_post) %>%
+  mutate(Site = as.numeric(Site), Subplot = as.numeric(Subplot))
+master_df <- left_join(master_df, rerere, by = c("Type", "Site", "Subplot")) %>% left_join(., rerere_detr, by = c("Type", "Site", "Subplot"))
+
+# Plot Resistance, Recovery, and Resilience
+rerere_for_plot <- rerere %>% gather(key="Parameter", value="Value", -Type, -Site, -Subplot)
+rerere_for_plot$Parameter <- factor(rerere_for_plot$Parameter, levels = c("Resistance", "Recovery", "Resilience"))
+
+rerere_plot2 <- ggplot(rerere_for_plot, aes(x=Parameter, y=Value, fill=Type)) +
+  geom_boxplot() +
+  scale_fill_viridis_d(option="viridis", end=0.6, name = "Forest type", guide = guide_legend(reverse = T), labels=c("Clearcut", "Non-clearcut")) +
+  plottheme + labs(x=element_blank(), y="Correlation value") +
+  labs(y="Index value") +
+  theme(axis.title.x = element_blank())
+
+# Statistics on ReReRe
+resis_stat <- lmerTest::lmer(Resistance ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(resis_stat, ddf = "Kenward-Roger", type = "II")
+reco_stat <- lmerTest::lmer(Recovery ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(reco_stat, ddf = "Kenward-Roger", type = "II")
+resil_stat <- lmerTest::lmer(Resilience ~ Type + Latitude + Altitude + Spruce_perc + AlCa_ratio + (1|Plot), master_df)
+anova(resil_stat, ddf = "Kenward-Roger", type = "II")
+
+mediation_analysis <- function(outcome, mediator, predictor = "Type", 
+                               covariates = c("Latitude", "Altitude", "Spruce_perc", "AlCa_ratio"),
+                               random_effect = "(1|Plot)", data) {
+  make_formula <- function(lhs, rhs_vars) {
+    as.formula(paste(lhs, "~", paste(rhs_vars, collapse = " + "), "+ (1|Plot)"))
+  }
+  formula1 <- make_formula(outcome, c(predictor, covariates))
+  model1 <- lmerTest::lmer(formula1, data = data)
+  b1 <- summary(model1)$coefficients[paste0(predictor, "NonDisrupted"), "Estimate"]
+  formula2 <- make_formula(mediator, c(predictor, covariates))
+  model2 <- lmerTest::lmer(formula2, data = data)
+  b2 <- summary(model2)$coefficients[paste0(predictor, "NonDisrupted"), "Estimate"]
+  formula3 <- make_formula(outcome, c(mediator, predictor, covariates))
+  model3 <- lmerTest::lmer(formula3, data = data)
+  b3 <- summary(model3)$coefficients[mediator, "Estimate"]
+  prop_medi <- (b2 * b3) / b1
+  return(list(
+    b1 = b1,
+    b2 = b2,
+    b3 = b3,
+    proportion_mediated = prop_medi
+  ))
+}
+
+mediation_result <- mediation_analysis(
+  outcome = "Resistance", # Change for resistance or recovery
+  mediator = "mean_age", # Change for all mediator variables
+  data = master_df
+)
+
+#### Supplementary plots ####
+# Figure S1: age structure
+age_str_for_plot <- age_str %>% group_by(ID) %>% arrange(desc(Age))
+age_plot_N <- age_str_for_plot %>% separate(ID, into = c("Type", "Site", "Subplot")) %>% filter(Type == "NonDisrupted") %>%
+  arrange(as.numeric(Site)) %>% unite(ID, c(Type, Site), sep = " ", remove = FALSE)
+age_plot_N$numbering <- ave(age_plot_N$Age, age_plot_N$ID, FUN = seq_along)
+numbers_age_plot_N <- master_df %>% filter(Type == "NonDisrupted") %>% group_by(Type, Site) %>% summarise(across(.cols = c("avg_age", "CoV_age"), list(mean))) %>% ungroup() %>%
+  arrange(as.numeric(Site)) %>% mutate(across(3:4, round, 0)) %>% unite(ID, c(Type, Site), sep = " ", remove = FALSE)
+plot_N_age <- ggplot() + facet_wrap(~factor(ID, levels=c("NonDisrupted 1","NonDisrupted 2","NonDisrupted 3","NonDisrupted 4","NonDisrupted 6",
+                                                         "NonDisrupted 7","NonDisrupted 8","NonDisrupted 9","NonDisrupted 10")), ncol = 5) +
+  geom_bar(age_plot_N, mapping=aes(x = numbering, y = Age), stat="identity") +
+  geom_label(numbers_age_plot_N, mapping=aes(x = Inf, y = Inf, label = paste("Median = ", avg_age_1), hjust="right", vjust="top"), family = "serif") +
+  geom_label(numbers_age_plot_N, mapping=aes(x = Inf, y = Inf, label = paste("CoV = ", CoV_age_1), hjust="right", vjust=2.1), family = "serif") +
+  coord_flip() + ylim(0,300) +
+  plottheme +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+age_plot_C <- age_str_for_plot %>% separate(ID, into = c("Type", "Site", "Subplot")) %>% filter(Type == "Disrupted") %>%
+  arrange(as.numeric(Site)) %>% unite(ID, c(Type, Site), sep = " ", remove = FALSE)
+age_plot_C$numbering <- ave(age_plot_C$Age, age_plot_C$ID, FUN = seq_along)
+numbers_age_plot_C <- master_df %>% filter(Type == "Disrupted") %>% group_by(Type, Site) %>% summarise(across(.cols = c("avg_age", "CoV_age"), list(mean))) %>% ungroup() %>%
+  arrange(as.numeric(Site)) %>% mutate(across(3:4, round, 0)) %>% unite(ID, c(Type, Site), sep = " ", remove = FALSE)
+plot_C_age <- ggplot() + facet_wrap(~factor(ID, levels=c("Disrupted 1","Disrupted 2","Disrupted 3","Disrupted 4","Disrupted 5",
+                                                         "Disrupted 6","Disrupted 7","Disrupted 9","Disrupted 10")), ncol = 5) +
+  geom_bar(age_plot_C, mapping=aes(x = numbering, y = Age), stat="identity") +
+  geom_label(numbers_age_plot_C, mapping=aes(x = Inf, y = Inf, label = paste("Median = ", avg_age_1), hjust="right", vjust="top"), family = "serif") +
+  geom_label(numbers_age_plot_C, mapping=aes(x = Inf, y = Inf, label = paste("CoV = ", CoV_age_1), hjust="right", vjust=2.1), family = "serif") +
+  coord_flip() + ylim(0,300) +
+  plottheme +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+age_str_plot <- ggarrange(plot_C_age + rremove("ylab"), plot_N_age + rremove("ylab"), labels = NULL, ncol = 1, nrow = 2)
+age_str_plot_annotated <- annotate_figure(age_str_plot, bottom = textGrob(expression(paste("Age")), gp=gpar(fontsize=14, fontfamily = "serif")))
+
+# Figure S2: growth pattern
+df_annual_age_biom <- annual_age_biom %>% gather(key="ID", value="annual_age_biomass", 2:ncol(annual_age_biom)) %>% drop_na(annual_age_biomass) %>%
+  separate(ID, c("Species", "Type", "Site", "Subplot", "Tree")) %>%
+  group_by(Type, Site, year) %>% summarise(annual_age_biomass=mean(annual_age_biomass, na.rm = T)) %>%
+  group_by(Type, year) %>% dplyr::summarise(across(.cols = annual_age_biomass, list(mean, sd)), count=n()) %>%
+  rename("mean_biomass" = "annual_age_biomass_1") %>% mutate(se_biomass = annual_age_biomass_2/sqrt(count)) %>% select(-annual_age_biomass_2) %>%
+  ungroup() %>% filter(case_when(Type=="Disrupted" ~ count > 8, Type=="NonDisrupted" ~ count > 8, TRUE ~ count > 4)) %>% filter(year>1) %>% select(-count)
+plot_growth <- ggplot() +
+  geom_ribbon(df_annual_age_biom, mapping = aes(x = year, ymin = mean_biomass-se_biomass, ymax = mean_biomass+se_biomass, group = Type, fill = Type), alpha = 0.3) +
+  geom_line(df_annual_age_biom, mapping = aes(x = year, y = mean_biomass, group = Type, col = Type), size = 0.8) +
+  scale_x_continuous(breaks = pretty_breaks(n=5)) +
+  labs(x="Age",linetype=NULL) +
+  plottheme +
+  theme(legend.position = c(0.8, 0.2)) +
+  theme(legend.background = element_rect(fill="white", size=0.5, linetype="solid", colour ="black")) +
+  scale_y_continuous(expression(paste("Growth rate (kg year "^-1*")"))) +
+  scale_fill_viridis_d(option="viridis", end=0.6, name = "Forest type", guide = guide_legend(order = 1, reverse = T), labels=c("Clearcut", "Non-clearcut")) +
+  scale_color_manual(values = c("black", "black")) +
+  guides(col="none")
+
+# Figure S3: weather plot
+clim_stats <- Climvars %>% drop_na() %>% group_by(Year) %>%
+  summarise(Tmean = mean(Mean_temp), Precip = mean(Precip)*365, SPEI = mean(SPEI))
+Tmean_dev <- lm(Tmean ~ Year, clim_stats)
+summary(Tmean_dev)
+Prec_dev <- lm(Precip ~ Year, clim_stats)
+summary(Prec_dev)
+SPEI_dev <- lm(SPEI ~ Year, clim_stats)
+summary(SPEI_dev)
+
+weather_df <- Climvars %>% group_by(Year, Month) %>% summarise(Prec = mean(Precip, na.rm=T)*30, Tmean = mean(Mean_temp, na.rm=T),
+                                                               SPEI = mean(SPEI))
+dfclimate_annual <- weather_df %>% group_by(Year) %>%
+  summarise(Tmean = mean(Tmean), Prec = mean(Prec)*12, SPEI = mean(SPEI))
+ylim.prim_temp <- c(-10, 7) # Annual min and max means
+ylim.sec_temp <- c(-26, 21) # Monthly min and max means
+btemp <- diff(ylim.prim_temp)/diff(ylim.sec_temp)
+atemp <- ylim.prim_temp[1] - btemp*ylim.sec_temp[1]
+temptime_plot <- ggplot() +
+  geom_line(weather_df, mapping = aes(x=Year+(Month*(1/12)), y=atemp+Tmean*btemp), color="red") +
+  geom_line(dfclimate_annual, mapping = aes(x=Year, y=Tmean), size = 1.1) +
+  scale_y_continuous(expression(paste("Temperature (\u00B0C)")), sec.axis = sec_axis(~ (. - atemp)/btemp)) +
+  xlim(1970,2021) + plottheme +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y.right = element_text(color="red")) +
+  annotate("text", x = 1970, y = 5, label = "A", family = "serif")
+ylim.prim_precip <- c(25*12, 65*12)
+ylim.sec_precip <- c(0, 120)
+bprecip <- diff(ylim.prim_precip)/diff(ylim.sec_precip)
+aprecip <- ylim.prim_precip[1] - bprecip*ylim.sec_precip[1]
+preciptime_plot <- ggplot() +
+  geom_line(weather_df, mapping = aes(x=Year+(Month*(1/12)), y=aprecip+Prec*bprecip), color="red") +
+  geom_line(dfclimate_annual, mapping = aes(x=Year, y=Prec), size = 1.1) +
+  scale_y_continuous(expression(paste("Precipitation (mm)")), sec.axis = sec_axis(~ (. - aprecip)/bprecip)) +
+  xlim(1970,2021) + plottheme +
+  theme(axis.title.x = element_blank(),
+        axis.text.y.right = element_text(color="red")) +
+  annotate("text", x = 1970, y = 1000, label = "B", family = "serif")
+time_plots <- ggarrange(temptime_plot + rremove("xlab"), preciptime_plot,
+                        ncol=1, nrow=2, align = "hv")
+
+# Figure S4: explanatory variables autocorrelation
+autocorr <- master_df %>% select(mean_age, CoV_age, mean_height, CoV_height, mean_cbh, CoV_cbh,
+                                 growth_rate, Soil_clim_stability, soil_org_mass, Latitude, Longitude, Altitude,
+                                 Spruce_perc, AlCa_ratio) %>%
+  rename("Mean tree age" = "mean_age", "Age CoV" = "CoV_age", "Mean tree height" = "mean_height",
+         "Height CoV" = "CoV_height", "Mean CBH" = "mean_cbh", "CBH CoV" = "CoV_cbh",
+         "Early growth rate" = "growth_rate", "Soil clim. var." = "Soil_clim_stability",
+         "Soil org. layer" = "soil_org_mass", "Spruce proportion" = "Spruce_perc", "Al:Ca" = "AlCa_ratio")
+autocorr2 <- cor(autocorr, use = "complete.obs")
+
+autocorr_plot <- ggcorrplot(autocorr2, lab=T, lab_size = 2.5, colors=c("red","white","blue"),
+                            legend.title="Correlation") +
+  theme_bw() +
+  theme(text = element_text(family = "serif")) +
+  theme(strip.background = element_rect(colour="black", fill="#CCCCCC", linetype="solid")) +
+  theme(axis.title = element_blank(),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.x = element_text(angle = 90, hjust=1))
+
