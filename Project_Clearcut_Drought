@@ -47,12 +47,12 @@ plottheme <- theme_bw() +
         strip.text.y = element_text(size=12))
 
 # Read data
-df <- read.csv(paste0(dir, "/Data/Clean/ring_widths.csv"))
-dfsoil <- read_excel(paste0(dir, "/Data/Clean/Soil_data.xlsx"))
-dftrees <- read_excel(paste0(dir, "/Data/Clean/Tree_data.xlsx"))
-soil_clim <- read.csv(paste0(dir, "/Data/Clean/Soil_clim.csv"))
-dfsites <- read_excel(paste0(dir, "/Data/Clean/Site_geography.xlsx"))
-Climvars <- read.csv(paste0(dir, "/Data/Clean/Climvars.csv"))
+df <- read.csv(paste0(dir, "/ring_widths.csv"))
+dfsoil <- read_excel(paste0(dir, "/Soil_data.xlsx"))
+dftrees <- read_excel(paste0(dir, "/Tree_data.xlsx"))
+soil_clim <- read.csv(paste0(dir, "/Soil_clim.csv"))
+dfsites <- read_excel(paste0(dir, "/Site_geography.xlsx"))
+Climvars <- read.csv(paste0(dir, "/Climvars.csv"))
 
 #### Data handling ####
 
