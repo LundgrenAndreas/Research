@@ -228,37 +228,50 @@ model.temper <- lme(RWI ~ Temper * Soil_moisture_model * Species * Mean_annual_t
                    correlation = corCAR1(),
                    data = df, na.action = na.omit)
 summary(model.temper)
+Anova(model.temper, type = 2)
+
 model.precip <- lme(RWI ~ Precip * Soil_moisture_model * Species * Mean_annual_temperature,
                     random = ~ Year2 + 1 | Site / ID,
                     correlation = corCAR1(),
                     data = df, na.action = na.omit)
 summary(model.precip)
+Anova(model.precip, type = 2)
+
 model.spei <- lme(RWI ~ SPEI * Soil_moisture_model * Species * Mean_annual_temperature,
                     random = ~ Year2 + 1 | Site / ID,
                     correlation = corCAR1(),
                     data = df, na.action = na.omit)
 summary(model.spei)
+Anova(model.spei, type = 2)
+
 model.vpd <- lme(RWI ~ VPD * Soil_moisture_model * Species * Mean_annual_temperature,
                   random = ~ Year2 + 1 | Site / ID,
                   correlation = corCAR1(),
                   data = df, na.action = na.omit)
 summary(model.vpd)
+Anova(model.vpd, type = 2)
 
 ## Coincidence rate
 model.hightemp <- lme(High_temp_coincidence ~ Soil_moisture_model * Species * Mean_annual_temperature,
                       random = ~ 1 | Site, data = coincide_stats, na.action = na.omit)
 summary(model.hightemp)
+Anova(model.hightemp, type = 2)
+
 model.lowprec <- lme(Low_prec_coincidence ~ Soil_moisture_model * Species * Mean_annual_temperature,
                       random = ~ 1 | Site, data = coincide_stats, na.action = na.omit)
 summary(model.lowprec)
+Anova(model.lowprec, type = 2)
 
 ## Resistance values
 model.hightempres <- lme(Resistance_temp ~ Soil_moisture_model * Species * Mean_annual_temperature,
                       random = ~ 1 | Site / ID, data = resistance_stats, na.action = na.omit)
 summary(model.hightempres)
+Anova(model.hightempres, type = 2)
+
 model.lowprecres <- lme(Resistance_precip ~ Soil_moisture_model * Species * Mean_annual_temperature,
                          random = ~ 1 | Site / ID, data = resistance_stats, na.action = na.omit)
 summary(model.lowprecres)
+Anova(model.lowprecres, type = 2)
 
 #### Graphs
 # Prediction details for figures
